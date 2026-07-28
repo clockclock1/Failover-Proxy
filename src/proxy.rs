@@ -1108,7 +1108,6 @@ async fn proxy_loop(
                 state.clone(),
                 model.clone(),
                 target.clone(),
-                cfg.clone(),
                 thread_id.to_string(),
                 requested_model.to_string(),
                 failed_models.clone(),
@@ -2352,7 +2351,6 @@ fn stream_response(
     state: AppState,
     model: ModelConfig,
     target: TargetConfig,
-    cfg: Config,
     thread_id: String,
     requested_model: String,
     failed_models: Vec<String>,
@@ -2409,8 +2407,8 @@ fn stream_response(
         if !completed {
             if let Some(mut stream) = inspected.stream {
                 loop {
-                    match tokio::time::timeout(target_timeout(&target, &cfg), stream.next()).await {
-                        Ok(Some(Ok(chunk))) => {
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
                             if completion.observe(&chunk) {
                                 completed = true;
                                 abort_guard.disarm();
@@ -2432,7 +2430,7 @@ fn stream_response(
                                 break;
                             }
                         }
-                        Ok(Some(Err(err))) => {
+                        Some(Err(err)) => {
                             stream_failure = Some(FailureInfo {
                                 status: StatusCode::BAD_GATEWAY.as_u16(),
                                 message: err.to_string(),
@@ -2440,18 +2438,10 @@ fn stream_response(
                             });
                             break;
                         }
-                        Ok(None) => {
+                        None => {
                             stream_failure = Some(FailureInfo {
                                 status: StatusCode::BAD_GATEWAY.as_u16(),
                                 message: "Upstream stream ended without a completion event".to_string(),
-                                ..FailureInfo::default()
-                            });
-                            break;
-                        }
-                        Err(_) => {
-                            stream_failure = Some(FailureInfo {
-                                status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                                message: "Upstream stream was idle for longer than its timeout".to_string(),
                                 ..FailureInfo::default()
                             });
                             break;
@@ -3770,6 +3760,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_continues_after_first_chunk_without_applying_target_timeout() {
+        let state = test_state().await;
+        let model = model();
+        let mut target = target();
+        target.timeout_ms = 5;
+        let slot = state.proxy_runtime.acquire(&model, "public-model").await;
+        let delayed_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+            Box::pin(async_stream::stream! {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+            });
+        let inspected = StreamInspection {
+            chunks: vec![Bytes::from_static(b"data: {\"delta\":\"hello\"}\n\n")],
+            stream: Some(delayed_stream),
+            failure: None,
+        };
+
+        let response = stream_response(
+            state.clone(),
+            model,
+            target,
+            slot.thread_id.as_ref().expect("thread id").clone(),
+            "public-model".to_string(),
+            Vec::new(),
+            Vec::new(),
+            "upstream|real-model".to_string(),
+            now_ms(),
+            now_ms(),
+            StatusCode::OK,
+            "text/event-stream".to_string(),
+            inspected,
+            false,
+            slot.into_stream_guard(),
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("stream body")
+            .to_bytes();
+        assert_eq!(
+            body,
+            Bytes::from_static(b"data: {\"delta\":\"hello\"}\n\ndata: [DONE]\n\n")
+        );
+        assert_eq!(state.stats.snapshot().await.successes, 1);
+    }
+
+    #[tokio::test]
     async fn dropping_stream_body_after_first_chunk_releases_thread() {
         let state = test_state().await;
         let model = model();
@@ -3785,7 +3824,6 @@ mod tests {
             state.clone(),
             model,
             target,
-            Config::default(),
             slot.thread_id.as_ref().expect("thread id").clone(),
             "public-model".to_string(),
             Vec::new(),
