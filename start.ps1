@@ -13,6 +13,15 @@ if (-not $DataDir) { $DataDir = Join-Path $root "data" }
 
 $releaseExe = Join-Path $root "target\release\failover-proxy.exe"
 $debugExe = Join-Path $root "target\debug\failover-proxy.exe"
+$embeddedIndex = Join-Path $root "assets\index.html"
+$uiInputs = @(
+  (Join-Path $root "ui\src"),
+  (Join-Path $root "ui\index.html"),
+  (Join-Path $root "ui\package.json"),
+  (Join-Path $root "ui\package-lock.json"),
+  (Join-Path $root "ui\vite.config.ts"),
+  (Join-Path $root "scripts\copy-ui.mjs")
+)
 $inputs = @(
   (Join-Path $root "Cargo.toml"),
   (Join-Path $root "Cargo.lock"),
@@ -37,6 +46,18 @@ function Test-NeedsBuild {
     }
   }
   return $false
+}
+
+if (Test-NeedsBuild -ExePath $embeddedIndex -InputPaths $uiInputs) {
+  $npm = Get-Command npm -ErrorAction SilentlyContinue
+  if (-not $npm) {
+    throw "Frontend sources are newer than embedded assets, but npm was not found. Install Node.js or run npm run build:ui first."
+  }
+  Write-Host "Building and embedding the admin UI..."
+  & npm run build:ui
+  if ($LASTEXITCODE -ne 0) {
+    throw "Frontend build failed (npm run build:ui)."
+  }
 }
 
 if (Test-NeedsBuild -ExePath $releaseExe -InputPaths $inputs) {

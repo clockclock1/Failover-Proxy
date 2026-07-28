@@ -1,8 +1,8 @@
 use crate::{
     auth,
     config::{
-        endpoint_suffix, target_label, trim_slashes, ApiKeyMode, Config, FailoverStrategy,
-        ModelConfig, TargetConfig,
+        endpoint_suffix, model_circuit, target_key, target_label, trim_slashes, ApiKeyMode, Config,
+        FailoverStrategy, ModelConfig, TargetConfig,
     },
     stats::{now_ms, FailureInfo, LogEntry, LogModelError, StatsStore},
     AppState,
@@ -19,8 +19,9 @@ use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{hash_map::DefaultHasher, HashSet},
     convert::Infallible,
+    hash::{Hash, Hasher},
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -33,6 +34,8 @@ use std::{
 enum ProxyCallError {
     #[error("timeout")]
     Timeout,
+    #[error("all API keys for this target are cooling down")]
+    KeysCoolingDown,
     #[error(transparent)]
     Request(#[from] reqwest::Error),
 }
@@ -79,13 +82,23 @@ impl ProxyEndpoint {
 struct CompatibleUpstream {
     response: reqwest::Response,
     endpoint: ProxyEndpoint,
+    api_key: String,
 }
 
 impl ProxyCallError {
     fn is_timeout(&self) -> bool {
         match self {
             Self::Timeout => true,
+            Self::KeysCoolingDown => false,
             Self::Request(err) => err.is_timeout(),
+        }
+    }
+
+    fn status(&self) -> u16 {
+        match self {
+            Self::Timeout => 504,
+            Self::KeysCoolingDown => 429,
+            Self::Request(_) => 0,
         }
     }
 }
@@ -93,6 +106,7 @@ impl ProxyCallError {
 #[derive(Clone, Default)]
 pub struct ProxyRuntime {
     round_robin: Arc<DashMap<String, AtomicU64>>,
+    api_key_cooldowns: Arc<DashMap<String, u64>>,
     active_threads: Arc<DashMap<String, ActiveThread>>,
     thread_seq: Arc<AtomicU64>,
 }
@@ -203,30 +217,81 @@ impl ProxyRuntime {
         });
     }
 
-    fn select_target_api_key(&self, target: &TargetConfig) -> String {
+    fn select_target_api_key(
+        &self,
+        model: &ModelConfig,
+        target: &TargetConfig,
+        excluded: &HashSet<String>,
+    ) -> Option<String> {
         let keys = target_api_keys(target);
-        if keys.len() <= 1 {
-            return keys.first().cloned().unwrap_or_default();
+        let available = keys
+            .into_iter()
+            .filter(|key| !excluded.contains(key) && self.is_api_key_available(model, target, key))
+            .collect::<Vec<_>>();
+        if available.is_empty() {
+            return None;
+        }
+        if available.len() == 1 {
+            return available.into_iter().next();
         }
         match target.api_key_mode {
             ApiKeyMode::RoundRobin => {
-                let cursor_key = format!(
-                    "api-key:{}:{}:{}",
-                    target.name, target.base_url, target.model_name
-                );
+                let cursor_key = format!("api-key:{}", target_key(model, target));
                 let cursor = self
                     .round_robin
                     .entry(cursor_key)
                     .or_insert_with(|| AtomicU64::new(0))
                     .fetch_add(1, AtomicOrdering::Relaxed) as usize;
-                keys[cursor % keys.len()].clone()
+                Some(available[cursor % available.len()].clone())
             }
             ApiKeyMode::Random => {
-                let idx = rand::random::<usize>() % keys.len();
-                keys[idx].clone()
+                let idx = rand::random::<usize>() % available.len();
+                Some(available[idx].clone())
             }
-            ApiKeyMode::Single => keys[0].clone(),
+            ApiKeyMode::Single => Some(available[0].clone()),
         }
+    }
+
+    fn is_api_key_available(
+        &self,
+        model: &ModelConfig,
+        target: &TargetConfig,
+        api_key: &str,
+    ) -> bool {
+        let id = api_key_cooldown_id(model, target, api_key);
+        let Some(until) = self.api_key_cooldowns.get(&id).map(|entry| *entry) else {
+            return true;
+        };
+        if now_ms() < until {
+            return false;
+        }
+        self.api_key_cooldowns.remove(&id);
+        true
+    }
+
+    fn record_api_key_failure(
+        &self,
+        model: &ModelConfig,
+        target: &TargetConfig,
+        api_key: &str,
+        status: u16,
+        cfg: &Config,
+    ) {
+        let breaker = model_circuit(model, cfg);
+        let cooldown_ms = match status {
+            429 => breaker.rate_limit_key_cooldown_seconds.saturating_mul(1000),
+            401 | 403 => breaker.auth_key_cooldown_minutes.saturating_mul(60 * 1000),
+            _ => return,
+        };
+        self.api_key_cooldowns.insert(
+            api_key_cooldown_id(model, target, api_key),
+            now_ms().saturating_add(cooldown_ms),
+        );
+    }
+
+    fn record_api_key_success(&self, model: &ModelConfig, target: &TargetConfig, api_key: &str) {
+        self.api_key_cooldowns
+            .remove(&api_key_cooldown_id(model, target, api_key));
     }
 
     pub fn retain_round_robin_models<I>(&self, model_names: I)
@@ -253,6 +318,14 @@ impl ProxyRuntime {
             self.round_robin.remove(&key);
         }
     }
+}
+
+fn api_key_cooldown_id(model: &ModelConfig, target: &TargetConfig, api_key: &str) -> String {
+    // Do not retain raw credentials in diagnostics or map keys.  The hash is
+    // only an in-process discriminator and is not used as a security boundary.
+    let mut hasher = DefaultHasher::new();
+    api_key.hash(&mut hasher);
+    format!("{}:{:x}", target_key(model, target), hasher.finish())
 }
 
 impl Drop for ProxySlot {
@@ -503,6 +576,7 @@ async fn proxy_loop(
                 state,
                 headers,
                 &target_body,
+                model,
                 &target,
                 cfg,
                 is_stream,
@@ -513,6 +587,7 @@ async fn proxy_loop(
                 Ok(upstream) => upstream,
                 Err(err) => {
                     let failure = FailureInfo {
+                        status: err.status(),
                         message: if err.is_timeout() {
                             "timeout".to_string()
                         } else {
@@ -559,8 +634,11 @@ async fn proxy_loop(
                 }
             };
 
-            let used_endpoint = upstream.endpoint;
-            let upstream = upstream.response;
+            let CompatibleUpstream {
+                response: upstream,
+                endpoint: used_endpoint,
+                api_key,
+            } = upstream;
             let status = upstream.status();
             let response_type = upstream
                 .headers()
@@ -575,6 +653,20 @@ async fn proxy_loop(
                     }
                     .to_string()
                 });
+
+            if status.is_success() {
+                state
+                    .proxy_runtime
+                    .record_api_key_success(model, &target, &api_key);
+            } else {
+                state.proxy_runtime.record_api_key_failure(
+                    model,
+                    &target,
+                    &api_key,
+                    status.as_u16(),
+                    cfg,
+                );
+            }
 
             if !status.is_success() {
                 let text = upstream.text().await.unwrap_or_default();
@@ -1157,6 +1249,7 @@ async fn call_target(
     state: &AppState,
     inbound_headers: &HeaderMap,
     body: &Value,
+    model: &ModelConfig,
     target: &TargetConfig,
     cfg: &Config,
     is_stream: bool,
@@ -1164,40 +1257,73 @@ async fn call_target(
 ) -> Result<CompatibleUpstream, ProxyCallError> {
     let timeout = target_timeout(target, cfg);
     let candidates = requested_endpoint.candidates();
-    let api_key = state.proxy_runtime.select_target_api_key(target);
-    for (idx, endpoint) in candidates.into_iter().enumerate() {
-        let upstream_stream = is_stream && endpoint == requested_endpoint;
-        let next_body =
-            build_upstream_body(body, target, requested_endpoint, endpoint, upstream_stream);
-        let mut req = state
-            .client
-            .post(upstream_endpoint_url(target, endpoint))
-            .header(header::CONTENT_TYPE, "application/json")
-            .bearer_auth(&api_key)
-            .body(serde_json::to_vec(&next_body).unwrap_or_default());
-        if let Some(value) = inbound_headers.get("openai-organization") {
-            req = req.header("openai-organization", value);
-        }
-        if let Some(value) = inbound_headers.get("openai-project") {
-            req = req.header("openai-project", value);
-        }
-        let response = if upstream_stream {
-            match tokio::time::timeout(timeout, req.send()).await {
-                Ok(result) => result?,
-                Err(_) => return Err(ProxyCallError::Timeout),
+    let mut attempted_keys = HashSet::new();
+    'api_keys: loop {
+        let api_key = state
+            .proxy_runtime
+            .select_target_api_key(model, target, &attempted_keys)
+            .ok_or(ProxyCallError::KeysCoolingDown)?;
+        attempted_keys.insert(api_key.clone());
+        for (idx, endpoint) in candidates.into_iter().enumerate() {
+            let upstream_stream = is_stream && endpoint == requested_endpoint;
+            let next_body =
+                build_upstream_body(body, target, requested_endpoint, endpoint, upstream_stream);
+            let mut req = state
+                .client
+                .post(upstream_endpoint_url(target, endpoint))
+                .header(header::CONTENT_TYPE, "application/json")
+                .bearer_auth(&api_key)
+                .body(serde_json::to_vec(&next_body).unwrap_or_default());
+            if let Some(value) = inbound_headers.get("openai-organization") {
+                req = req.header("openai-organization", value);
             }
-        } else {
-            req.timeout(timeout).send().await?
-        };
-        if response.status().is_success() || idx == 2 {
-            return Ok(CompatibleUpstream { response, endpoint });
+            if let Some(value) = inbound_headers.get("openai-project") {
+                req = req.header("openai-project", value);
+            }
+            let response = if upstream_stream {
+                match tokio::time::timeout(timeout, req.send()).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(ProxyCallError::Timeout),
+                }
+            } else {
+                req.timeout(timeout).send().await?
+            };
+            if matches!(response.status().as_u16(), 401 | 403 | 429)
+                && target.api_key_mode != ApiKeyMode::Single
+            {
+                state.proxy_runtime.record_api_key_failure(
+                    model,
+                    target,
+                    &api_key,
+                    response.status().as_u16(),
+                    cfg,
+                );
+                if state
+                    .proxy_runtime
+                    .select_target_api_key(model, target, &attempted_keys)
+                    .is_some()
+                {
+                    continue 'api_keys;
+                }
+            }
+            if response.status().is_success() || idx == 2 {
+                return Ok(CompatibleUpstream {
+                    response,
+                    endpoint,
+                    api_key,
+                });
+            }
+            if is_endpoint_unsupported_status(response.status()) {
+                continue;
+            }
+            return Ok(CompatibleUpstream {
+                response,
+                endpoint,
+                api_key,
+            });
         }
-        if is_endpoint_unsupported_status(response.status()) {
-            continue;
-        }
-        return Ok(CompatibleUpstream { response, endpoint });
+        unreachable!("endpoint candidate list is non-empty")
     }
-    unreachable!("endpoint candidate list is non-empty")
 }
 
 fn compact_request_context(body: &Value, requested: ProxyEndpoint) -> Option<Value> {
@@ -1414,14 +1540,25 @@ fn build_upstream_body(
                     "presence_penalty",
                     "frequency_penalty",
                     "stop",
-                    "tools",
-                    "tool_choice",
                     "response_format",
                     "seed",
                     "user",
                     "metadata",
                 ],
             );
+            if requested == ProxyEndpoint::Responses {
+                if let Some(tools) = body.get("tools") {
+                    out.insert("tools".to_string(), responses_tools_to_chat(tools));
+                }
+                if let Some(tool_choice) = body.get("tool_choice") {
+                    out.insert(
+                        "tool_choice".to_string(),
+                        responses_tool_choice_to_chat(tool_choice),
+                    );
+                }
+            } else {
+                copy_request_fields(body, &mut out, &["tools", "tool_choice"]);
+            }
             if let Some(value) = body
                 .get("max_tokens")
                 .or_else(|| body.get("max_output_tokens"))
@@ -1553,20 +1690,89 @@ fn responses_input_to_chat_messages(input: Option<&Value>) -> Vec<Value> {
         Some(Value::String(text)) => vec![chat_message("user", text)],
         Some(Value::Array(items)) => items
             .iter()
-            .map(|item| {
-                if item.get("role").is_some() || item.get("content").is_some() {
-                    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                    json!({
-                        "role": role,
-                        "content": map_content_parts(item.get("content"), true)
-                    })
-                } else {
-                    chat_message("user", value_to_text(item))
-                }
-            })
+            .map(response_input_item_to_chat_message)
             .collect(),
         Some(value) => vec![chat_message("user", value_to_text(value))],
         None => Vec::new(),
+    }
+}
+
+fn response_input_item_to_chat_message(item: &Value) -> Value {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let arguments = item.get("arguments").map(value_to_text).unwrap_or_default();
+            json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                }]
+            })
+        }
+        Some("function_call_output") => json!({
+            "role": "tool",
+            "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+            "content": value_to_text(item.get("output").unwrap_or(&Value::Null))
+        }),
+        _ if item.get("role").is_some() || item.get("content").is_some() => {
+            let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+            json!({
+                "role": role,
+                "content": map_content_parts(item.get("content"), true)
+            })
+        }
+        _ => chat_message("user", value_to_text(item)),
+    }
+}
+
+fn responses_tools_to_chat(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|tool| {
+                        if tool.get("type").and_then(Value::as_str) == Some("function")
+                            && tool.get("function").is_none()
+                        {
+                            json!({
+                                "type": "function",
+                                "function": {
+                                    "name": tool.get("name").and_then(Value::as_str).unwrap_or_default(),
+                                    "description": tool.get("description").cloned().unwrap_or(Value::Null),
+                                    "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                                    "strict": tool.get("strict").cloned().unwrap_or(Value::Null),
+                                }
+                            })
+                        } else {
+                            tool.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
+    if tool_choice.get("type").and_then(Value::as_str) == Some("function")
+        && tool_choice.get("function").is_none()
+    {
+        json!({
+            "type": "function",
+            "function": {"name": tool_choice.get("name").and_then(Value::as_str).unwrap_or_default()}
+        })
+    } else {
+        tool_choice.clone()
     }
 }
 
@@ -1770,13 +1976,40 @@ fn response_as_responses(
     target: &TargetConfig,
 ) -> Value {
     let text = response_text(upstream, payload);
+    let output = responses_output_from_upstream(upstream, payload, &text);
     json!({
         "id": response_id(payload, "resp"),
         "object": "response",
         "created_at": response_created(payload),
         "status": "completed",
         "model": requested_model,
-        "output": [{
+        "output": output,
+        "output_text": text,
+        "usage": payload.get("usage").cloned().unwrap_or_else(|| json!({})),
+        "failover_proxy_upstream": {
+            "endpoint": upstream.suffix(),
+            "target": target.name,
+            "model": target.model_name,
+        }
+    })
+}
+
+fn responses_output_from_upstream(
+    upstream: ProxyEndpoint,
+    payload: &Value,
+    text: &str,
+) -> Vec<Value> {
+    if upstream == ProxyEndpoint::Responses {
+        return payload
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(json!({
             "type": "message",
             "id": format!("msg_{}", now_ms()),
             "status": "completed",
@@ -1786,15 +2019,46 @@ fn response_as_responses(
                 "text": text,
                 "annotations": []
             }]
-        }],
-        "output_text": text,
-        "usage": payload.get("usage").cloned().unwrap_or_else(|| json!({})),
-        "failover_proxy_upstream": {
-            "endpoint": upstream.suffix(),
-            "target": target.name,
-            "model": target.model_name,
+        }));
+    }
+    for call in assistant_tool_calls(payload) {
+        let function = call.get("function").unwrap_or(&call);
+        let call_id = call
+            .get("id")
+            .or_else(|| call.get("call_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = function
+            .get("name")
+            .or_else(|| call.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments = function
+            .get("arguments")
+            .or_else(|| call.get("arguments"))
+            .map(value_to_text)
+            .unwrap_or_default();
+        if !name.is_empty() {
+            output.push(json!({
+                "type": "function_call",
+                "id": format!("fc_{}", call_id),
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": "completed"
+            }));
         }
-    })
+    }
+    if output.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "id": format!("msg_{}", now_ms()),
+            "status": "completed",
+            "role": "assistant",
+            "content": []
+        }));
+    }
+    output
 }
 
 fn response_as_completions(
@@ -1959,14 +2223,7 @@ fn synthetic_sse_text(endpoint: ProxyEndpoint, payload: &Value) -> String {
             });
             format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n", first, done)
         }
-        ProxyEndpoint::Responses => {
-            let delta = json!({ "type": "response.output_text.delta", "delta": text });
-            let completed = json!({ "type": "response.completed", "response": payload });
-            format!(
-                "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
-                delta, completed
-            )
-        }
+        ProxyEndpoint::Responses => synthetic_responses_sse(payload, &text),
         ProxyEndpoint::Completions => {
             let chunk = json!({
                 "id": response_id(payload, "cmpl"),
@@ -1978,6 +2235,48 @@ fn synthetic_sse_text(endpoint: ProxyEndpoint, payload: &Value) -> String {
             format!("data: {}\n\ndata: [DONE]\n\n", chunk)
         }
     }
+}
+
+fn synthetic_responses_sse(payload: &Value, text: &str) -> String {
+    let mut response = payload.clone();
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "status".to_string(),
+            Value::String("in_progress".to_string()),
+        );
+    }
+    let created = json!({ "type": "response.created", "response": response });
+    let mut events = vec![format!("event: response.created\ndata: {}\n\n", created)];
+
+    for (output_index, item) in payload
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        events.push(format!(
+            "event: response.output_item.added\ndata: {}\n\n",
+            json!({ "type": "response.output_item.added", "output_index": output_index, "item": item })
+        ));
+        if item.get("type").and_then(Value::as_str) == Some("message") && !text.is_empty() {
+            events.push(format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({ "type": "response.output_text.delta", "output_index": output_index, "content_index": 0, "delta": text })
+            ));
+        }
+        events.push(format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            json!({ "type": "response.output_item.done", "output_index": output_index, "item": item })
+        ));
+    }
+
+    events.push(format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({ "type": "response.completed", "response": payload })
+    ));
+    events.push("data: [DONE]\n\n".to_string());
+    events.concat()
 }
 
 fn target_timeout(target: &TargetConfig, cfg: &Config) -> Duration {
@@ -2053,7 +2352,7 @@ fn stream_response(
     state: AppState,
     model: ModelConfig,
     target: TargetConfig,
-    _cfg: Config,
+    cfg: Config,
     thread_id: String,
     requested_model: String,
     failed_models: Vec<String>,
@@ -2109,9 +2408,9 @@ fn stream_response(
         }
         if !completed {
             if let Some(mut stream) = inspected.stream {
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(chunk) => {
+                loop {
+                    match tokio::time::timeout(target_timeout(&target, &cfg), stream.next()).await {
+                        Ok(Some(Ok(chunk))) => {
                             if completion.observe(&chunk) {
                                 completed = true;
                                 abort_guard.disarm();
@@ -2133,15 +2432,38 @@ fn stream_response(
                                 break;
                             }
                         }
-                        Err(err) => {
+                        Ok(Some(Err(err))) => {
                             stream_failure = Some(FailureInfo {
+                                status: StatusCode::BAD_GATEWAY.as_u16(),
                                 message: err.to_string(),
+                                ..FailureInfo::default()
+                            });
+                            break;
+                        }
+                        Ok(None) => {
+                            stream_failure = Some(FailureInfo {
+                                status: StatusCode::BAD_GATEWAY.as_u16(),
+                                message: "Upstream stream ended without a completion event".to_string(),
+                                ..FailureInfo::default()
+                            });
+                            break;
+                        }
+                        Err(_) => {
+                            stream_failure = Some(FailureInfo {
+                                status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                                message: "Upstream stream was idle for longer than its timeout".to_string(),
                                 ..FailureInfo::default()
                             });
                             break;
                         }
                     }
                 }
+            } else {
+                stream_failure = Some(FailureInfo {
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    message: "Upstream stream ended without a completion event".to_string(),
+                    ..FailureInfo::default()
+                });
             }
         }
         if !completed {
@@ -2269,6 +2591,13 @@ fn stream_text_has_done_marker(text: &str) -> bool {
             .strip_prefix("data:")
             .map(|data| data.trim() == "[DONE]")
             .unwrap_or(false)
+    }) || parse_sse_data_payloads(text).iter().any(|data| {
+        parse_json_safe(data).is_some_and(|payload| {
+            payload.get("type").and_then(Value::as_str) == Some("response.completed")
+                || payload
+                    .pointer("/choices/0/finish_reason")
+                    .is_some_and(|reason| !reason.is_null())
+        })
     })
 }
 
@@ -2392,9 +2721,31 @@ fn parse_json_safe(text: &str) -> Option<Value> {
 
 fn embedded_error(payload: Option<&Value>, text: &str) -> Option<FailureInfo> {
     let payload = payload?;
+    let provider_code = payload
+        .get("code")
+        .or_else(|| payload.pointer("/error/code"))
+        .or_else(|| payload.pointer("/detail/code"));
+    let provider_code_is_error = provider_code.is_some_and(|value| {
+        value.as_u64().is_some_and(|code| code >= 400)
+            || value.as_str().is_some_and(|code| {
+                code.parse::<u16>().is_ok_and(|status| status >= 400)
+                    || [
+                        "error",
+                        "invalid",
+                        "limit",
+                        "quota",
+                        "unauthorized",
+                        "forbidden",
+                    ]
+                    .iter()
+                    .any(|marker| code.to_ascii_lowercase().contains(marker))
+            })
+    });
     let has_explicit_error = payload.get("error").is_some()
         || payload.get("error_message").is_some()
-        || payload.get("status_code").is_some();
+        || payload.get("status_code").is_some()
+        || provider_code_is_error
+        || payload.get("success").and_then(Value::as_bool) == Some(false);
     let error = payload
         .get("error")
         .or_else(|| payload.pointer("/detail/error"))
@@ -2415,6 +2766,12 @@ fn embedded_error(payload: Option<&Value>, text: &str) -> Option<FailureInfo> {
         if let Some(s) = payload.get("message").and_then(Value::as_str) {
             candidates.push(s.to_string());
         }
+        if let Some(s) = payload.get("msg").and_then(Value::as_str) {
+            candidates.push(s.to_string());
+        }
+        if let Some(s) = payload.get("error_description").and_then(Value::as_str) {
+            candidates.push(s.to_string());
+        }
     }
     if let Some(s) = payload.get("detail").and_then(Value::as_str) {
         candidates.push(s.to_string());
@@ -2433,7 +2790,8 @@ fn embedded_error(payload: Option<&Value>, text: &str) -> Option<FailureInfo> {
                 .or_else(|| err.get("code"))
         })
         .or_else(|| payload.get("status"))
-        .or_else(|| payload.get("status_code"));
+        .or_else(|| payload.get("status_code"))
+        .or(provider_code);
     let numeric = raw_status
         .and_then(|value| {
             value
@@ -2449,7 +2807,10 @@ fn embedded_error(payload: Option<&Value>, text: &str) -> Option<FailureInfo> {
                 .and_then(|m| m.as_str().parse::<u16>().ok())
         })
         .unwrap_or(0);
-    let inferred_status = infer_error_status(error, &message);
+    let inferred_status = infer_error_status(
+        provider_code.or(error.and_then(|err| err.get("code"))),
+        &message,
+    );
     let status = if numeric >= 400 {
         numeric
     } else if regex_status >= 400 {
@@ -2472,9 +2833,8 @@ fn embedded_error(payload: Option<&Value>, text: &str) -> Option<FailureInfo> {
     }
 }
 
-fn infer_error_status(error: Option<&Value>, message: &str) -> u16 {
-    let code = error
-        .and_then(|value| value.get("code"))
+fn infer_error_status(code_value: Option<&Value>, message: &str) -> u16 {
+    let code = code_value
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -2491,6 +2851,22 @@ fn infer_error_status(error: Option<&Value>, message: &str) -> u16 {
     .any(|marker| description.contains(marker))
     {
         StatusCode::TOO_MANY_REQUESTS.as_u16()
+    } else if [
+        "invalid_api_key",
+        "invalid api key",
+        "authentication",
+        "unauthorized",
+        "api key",
+    ]
+    .iter()
+    .any(|marker| description.contains(marker))
+    {
+        StatusCode::UNAUTHORIZED.as_u16()
+    } else if ["forbidden", "permission denied", "access denied"]
+        .iter()
+        .any(|marker| description.contains(marker))
+    {
+        StatusCode::FORBIDDEN.as_u16()
     } else {
         0
     }
@@ -2686,18 +3062,12 @@ fn regular_attempt_limit(target: &TargetConfig) -> u32 {
 
 fn should_retry_target(
     failure: &FailureInfo,
-    cfg: &Config,
+    _cfg: &Config,
     attempt: u32,
     max_attempts: u32,
-    model: &ModelConfig,
+    _model: &ModelConfig,
 ) -> bool {
     if attempt >= max_attempts {
-        return false;
-    }
-    if crate::config::model_circuit(model, cfg)
-        .immediate_cooldown_status_codes
-        .contains(&failure.status)
-    {
         return false;
     }
     if failure.status == 0 {
@@ -2871,7 +3241,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use reqwest::Client;
-    use std::{path::PathBuf, sync::Arc};
+    use std::{collections::HashSet, path::PathBuf, sync::Arc};
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
@@ -2886,7 +3256,8 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
-        let dir = std::env::temp_dir().join(format!("failover-proxy-proxy-test-{}", Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("failover-proxy-proxy-test-{}", Uuid::new_v4()));
         let stats_path = dir.join("stats.json");
         let logs_path = dir.join("request-logs.csv");
         let model_stats_path = dir.join("model-stats.csv");
@@ -2985,6 +3356,31 @@ mod tests {
 
         assert_eq!(failure.status, 429);
         assert_eq!(failure.message, "Please retry later");
+    }
+
+    #[test]
+    fn provider_style_code_and_msg_errors_are_classified() {
+        let failure = classify_upstream_failure(
+            200,
+            r#"{"code":429,"msg":"rate limit reached"}"#,
+            true,
+            true,
+        )
+        .expect("provider error must fail the attempt");
+
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.message, "rate limit reached");
+
+        let failure = classify_upstream_failure(
+            200,
+            r#"{"success":false,"code":"invalid_api_key","message":"key rejected"}"#,
+            true,
+            true,
+        )
+        .expect("provider error must fail the attempt");
+
+        assert_eq!(failure.status, 401);
+        assert_eq!(failure.message, "key rejected");
     }
 
     #[test]
@@ -3097,6 +3493,102 @@ mod tests {
     }
 
     #[test]
+    fn responses_tools_and_tool_history_are_converted_for_chat_upstream() {
+        let body = json!({
+            "model": "public-model",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "list files"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"command\":\"dir\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "Cargo.toml"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "description": "Run a command",
+                "parameters": {"type": "object"},
+                "strict": true
+            }],
+            "tool_choice": {"type": "function", "name": "shell"}
+        });
+
+        let converted = build_upstream_body(
+            &body,
+            &target(),
+            ProxyEndpoint::Responses,
+            ProxyEndpoint::ChatCompletions,
+            false,
+        );
+
+        assert_eq!(converted["tools"][0]["type"], "function");
+        assert_eq!(converted["tools"][0]["function"]["name"], "shell");
+        assert_eq!(converted["tool_choice"]["function"]["name"], "shell");
+        assert_eq!(converted["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(converted["messages"][1]["role"], "assistant");
+        assert_eq!(converted["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(converted["messages"][2]["role"], "tool");
+        assert_eq!(converted["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(converted["messages"][2]["content"], "Cargo.toml");
+    }
+
+    #[test]
+    fn chat_tool_calls_are_returned_as_responses_function_calls() {
+        let upstream = json!({
+            "id": "chatcmpl_1",
+            "created": 123,
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"command\":\"dir\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let converted = response_payload_as(
+            ProxyEndpoint::Responses,
+            ProxyEndpoint::ChatCompletions,
+            &upstream,
+            "public-model",
+            &target(),
+        );
+
+        assert_eq!(converted["object"], "response");
+        assert_eq!(converted["output"][0]["type"], "function_call");
+        assert_eq!(converted["output"][0]["call_id"], "call_1");
+        assert_eq!(converted["output"][0]["name"], "shell");
+        assert_eq!(converted["output"][0]["arguments"], "{\"command\":\"dir\"}");
+    }
+
+    #[test]
+    fn fallback_responses_stream_contains_lifecycle_events() {
+        let payload = json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "pong", "annotations": []}]
+            }]
+        });
+
+        let stream = synthetic_sse_text(ProxyEndpoint::Responses, &payload);
+        assert!(stream.contains("event: response.created"));
+        assert!(stream.contains("event: response.output_item.added"));
+        assert!(stream.contains("event: response.output_text.delta"));
+        assert!(stream.contains("event: response.output_item.done"));
+        assert!(stream.contains("event: response.completed"));
+        assert!(stream.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
     fn completions_response_can_be_returned_as_chat_response() {
         let upstream = json!({
             "id": "cmpl-1",
@@ -3190,16 +3682,56 @@ mod tests {
     }
 
     #[test]
+    fn stream_completion_detector_recognizes_responses_and_chat_completion_events() {
+        let mut responses = StreamCompletionDetector::default();
+        assert!(responses.observe(&Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+        )));
+
+        let mut chat = StreamCompletionDetector::default();
+        assert!(chat.observe(&Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+        )));
+    }
+
+    #[test]
     fn target_api_keys_round_robin_across_requests() {
         let runtime = ProxyRuntime::default();
+        let model = model();
         let mut target = target();
         target.api_key = "sk-a".to_string();
         target.api_keys = vec!["sk-a".to_string(), "sk-b".to_string()];
         target.api_key_mode = ApiKeyMode::RoundRobin;
 
-        assert_eq!(runtime.select_target_api_key(&target), "sk-a");
-        assert_eq!(runtime.select_target_api_key(&target), "sk-b");
-        assert_eq!(runtime.select_target_api_key(&target), "sk-a");
+        assert_eq!(
+            runtime.select_target_api_key(&model, &target, &HashSet::new()),
+            Some("sk-a".to_string())
+        );
+        assert_eq!(
+            runtime.select_target_api_key(&model, &target, &HashSet::new()),
+            Some("sk-b".to_string())
+        );
+        assert_eq!(
+            runtime.select_target_api_key(&model, &target, &HashSet::new()),
+            Some("sk-a".to_string())
+        );
+    }
+
+    #[test]
+    fn rate_limited_key_is_skipped_without_disabling_its_sibling_key() {
+        let runtime = ProxyRuntime::default();
+        let model = model();
+        let mut target = target();
+        target.api_key = "sk-a".to_string();
+        target.api_keys = vec!["sk-a".to_string(), "sk-b".to_string()];
+        target.api_key_mode = ApiKeyMode::RoundRobin;
+
+        runtime.record_api_key_failure(&model, &target, "sk-a", 429, &Config::default());
+
+        assert_eq!(
+            runtime.select_target_api_key(&model, &target, &HashSet::new()),
+            Some("sk-b".to_string())
+        );
     }
 
     #[tokio::test]

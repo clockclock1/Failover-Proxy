@@ -1,14 +1,29 @@
 use crate::{
-    config::{model_circuit, target_key, Config, ModelConfig, TargetConfig},
+    config::{model_circuit, target_key, CircuitBreakerConfig, Config, ModelConfig, TargetConfig},
     stats::{now_ms, FailureInfo, StatsStore},
 };
 use dashmap::DashMap;
 use std::{collections::HashSet, sync::Arc};
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum FailureKind {
+    /// A bad or exhausted credential is isolated at the API-key layer.
+    Authentication,
+    /// A 429 is isolated at the API-key layer so sibling keys can continue.
+    RateLimited,
+    /// The upstream endpoint does not support the requested protocol.
+    Compatibility,
+    /// Timeouts, connection errors, and server-side failures.
+    Transient,
+    #[default]
+    Other,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BreakerState {
     pub failures: u32,
     pub disabled_until: u64,
+    kind: FailureKind,
 }
 
 #[derive(Clone, Default)]
@@ -92,14 +107,27 @@ impl CircuitBreakers {
     ) {
         let key = target_key(model, target);
         let breaker_cfg = model_circuit(model, cfg);
+        let kind = classify_failure_kind(&failure);
+        let Some((failure_threshold, cooldown_ms)) = target_breaker_policy(kind, &breaker_cfg)
+        else {
+            // Authentication and rate-limit failures are scoped to the API
+            // key by ProxyRuntime.  Never let one exhausted/bad key poison a
+            // target that may contain several healthy credentials.
+            self.inner.remove(&key);
+            stats
+                .record_target(model, target, false, cfg, failure, latency_ms, 0, 0)
+                .await;
+            return;
+        };
         let mut state = self.inner.entry(key).or_default();
+        if state.kind != kind {
+            state.failures = 0;
+            state.disabled_until = 0;
+            state.kind = kind;
+        }
         state.failures += 1;
-        if state.failures >= breaker_cfg.failure_threshold
-            || breaker_cfg
-                .immediate_cooldown_status_codes
-                .contains(&failure.status)
-        {
-            state.disabled_until = now_ms() + breaker_cfg.cooldown_minutes * 60 * 1000;
+        if state.failures >= failure_threshold {
+            state.disabled_until = now_ms() + cooldown_ms;
         }
         let disabled_until = state.disabled_until;
         let failures = state.failures;
@@ -150,5 +178,63 @@ impl CircuitBreakers {
         for key in stale {
             self.inner.remove(&key);
         }
+    }
+}
+
+fn classify_failure_kind(failure: &FailureInfo) -> FailureKind {
+    match failure.status {
+        401 | 403 => FailureKind::Authentication,
+        429 => FailureKind::RateLimited,
+        404 | 405 | 406 | 415 | 501 => FailureKind::Compatibility,
+        0 | 408 | 409 | 500 | 502 | 503 | 504 => FailureKind::Transient,
+        status if status >= 500 => FailureKind::Transient,
+        _ => FailureKind::Other,
+    }
+}
+
+fn target_breaker_policy(kind: FailureKind, cfg: &CircuitBreakerConfig) -> Option<(u32, u64)> {
+    match kind {
+        FailureKind::Authentication | FailureKind::RateLimited => None,
+        FailureKind::Compatibility => Some((1, cfg.compatibility_cooldown_minutes * 60 * 1000)),
+        FailureKind::Transient => Some((
+            cfg.transient_failure_threshold,
+            cfg.transient_cooldown_seconds * 1000,
+        )),
+        FailureKind::Other => Some((cfg.failure_threshold, cfg.cooldown_minutes * 60 * 1000)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_failure_kind, target_breaker_policy, FailureKind};
+    use crate::{config::CircuitBreakerConfig, stats::FailureInfo};
+
+    #[test]
+    fn isolates_key_scoped_failures_from_target_breaker() {
+        assert_eq!(
+            classify_failure_kind(&FailureInfo {
+                status: 429,
+                ..FailureInfo::default()
+            }),
+            FailureKind::RateLimited
+        );
+        assert!(target_breaker_policy(
+            FailureKind::Authentication,
+            &CircuitBreakerConfig::default(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compatibility_opens_immediately_but_transient_uses_own_threshold() {
+        let cfg = CircuitBreakerConfig::default();
+        assert_eq!(
+            target_breaker_policy(FailureKind::Compatibility, &cfg),
+            Some((1, 10 * 60 * 1000))
+        );
+        assert_eq!(
+            target_breaker_policy(FailureKind::Transient, &cfg),
+            Some((3, 60 * 1000))
+        );
     }
 }

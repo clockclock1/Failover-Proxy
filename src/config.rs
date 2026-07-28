@@ -34,7 +34,18 @@ pub struct ProxyKey {
 pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     pub cooldown_minutes: u64,
-    pub immediate_cooldown_status_codes: Vec<u16>,
+    /// Per-key cooldown after a 429.  This deliberately does not open the
+    /// whole target: another credential may still have quota available.
+    pub rate_limit_key_cooldown_seconds: u64,
+    /// Per-key cooldown after a credential/authentication failure (401/403).
+    pub auth_key_cooldown_minutes: u64,
+    /// Consecutive transport, timeout, and 5xx failures before opening a
+    /// target-level breaker.
+    pub transient_failure_threshold: u32,
+    /// Target-level breaker duration for transient failures.
+    pub transient_cooldown_seconds: u64,
+    /// Target-level breaker duration for endpoint/protocol incompatibility.
+    pub compatibility_cooldown_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,7 +193,11 @@ impl Default for CircuitBreakerConfig {
         Self {
             failure_threshold: 3,
             cooldown_minutes: 10,
-            immediate_cooldown_status_codes: vec![429],
+            rate_limit_key_cooldown_seconds: 60,
+            auth_key_cooldown_minutes: 30,
+            transient_failure_threshold: 3,
+            transient_cooldown_seconds: 60,
+            compatibility_cooldown_minutes: 10,
         }
     }
 }
@@ -356,8 +371,20 @@ pub fn normalize_circuit(mut breaker: CircuitBreakerConfig) -> CircuitBreakerCon
     if breaker.cooldown_minutes == 0 {
         breaker.cooldown_minutes = 10;
     }
-    if breaker.immediate_cooldown_status_codes.is_empty() {
-        breaker.immediate_cooldown_status_codes = vec![429];
+    if breaker.rate_limit_key_cooldown_seconds == 0 {
+        breaker.rate_limit_key_cooldown_seconds = 60;
+    }
+    if breaker.auth_key_cooldown_minutes == 0 {
+        breaker.auth_key_cooldown_minutes = 30;
+    }
+    if breaker.transient_failure_threshold == 0 {
+        breaker.transient_failure_threshold = 3;
+    }
+    if breaker.transient_cooldown_seconds == 0 {
+        breaker.transient_cooldown_seconds = 60;
+    }
+    if breaker.compatibility_cooldown_minutes == 0 {
+        breaker.compatibility_cooldown_minutes = 10;
     }
     breaker
 }
@@ -480,7 +507,11 @@ pub fn model_circuit(model: &ModelConfig, cfg: &Config) -> CircuitBreakerConfig 
     let model_breaker = &model.circuit_breaker;
     breaker.failure_threshold = model_breaker.failure_threshold;
     breaker.cooldown_minutes = model_breaker.cooldown_minutes;
-    breaker.immediate_cooldown_status_codes = model_breaker.immediate_cooldown_status_codes.clone();
+    breaker.rate_limit_key_cooldown_seconds = model_breaker.rate_limit_key_cooldown_seconds;
+    breaker.auth_key_cooldown_minutes = model_breaker.auth_key_cooldown_minutes;
+    breaker.transient_failure_threshold = model_breaker.transient_failure_threshold;
+    breaker.transient_cooldown_seconds = model_breaker.transient_cooldown_seconds;
+    breaker.compatibility_cooldown_minutes = model_breaker.compatibility_cooldown_minutes;
     normalize_circuit(breaker)
 }
 

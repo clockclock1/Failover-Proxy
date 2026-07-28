@@ -27,9 +27,11 @@
   "circuitBreaker": {
     "failureThreshold": 3,
     "cooldownMinutes": 10,
-    "immediateCooldownStatusCodes": [
-      429
-    ]
+    "rateLimitKeyCooldownSeconds": 60,
+    "authKeyCooldownMinutes": 30,
+    "transientFailureThreshold": 3,
+    "transientCooldownSeconds": 60,
+    "compatibilityCooldownMinutes": 10
   },
   "modelSource": {
     "enabled": false,
