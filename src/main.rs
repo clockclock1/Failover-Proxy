@@ -43,8 +43,6 @@ struct Cli {
     model_stats_path: Option<PathBuf>,
     #[arg(long, env = "RUNTIME_STATS_PATH")]
     runtime_stats_path: Option<PathBuf>,
-    #[arg(long, env = "BODY_LIMIT_MB", default_value_t = 50)]
-    body_limit_mb: usize,
 }
 
 #[derive(Clone)]
@@ -128,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         auth: auth::AuthState::default(),
         client,
     };
+    admin::spawn_runtime_state_cleanup(state.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
@@ -212,7 +211,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/completions", post(proxy::proxy_endpoint))
         .route("/completions", post(proxy::proxy_endpoint))
         .fallback(get(admin::static_ui))
-        .layer(DefaultBodyLimit::max(cli.body_limit_mb * 1024 * 1024))
+        // The proxy accepts long context windows and file-like inputs. Do not
+        // impose Axum's default request-body size cap; upstreams and callers
+        // decide the practical request size.
+        .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state);

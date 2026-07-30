@@ -1,6 +1,6 @@
 use crate::{
     config::{model_circuit, target_key, CircuitBreakerConfig, Config, ModelConfig, TargetConfig},
-    stats::{now_ms, FailureInfo, StatsStore},
+    stats::{dashmap_memory_overhead, now_ms, FailureInfo, RuntimeMemoryUsage, StatsStore},
 };
 use dashmap::DashMap;
 use std::{collections::HashSet, sync::Arc};
@@ -153,6 +153,31 @@ impl CircuitBreakers {
         }
     }
 
+    pub fn cleanup_expired(&self) {
+        let now = now_ms();
+        let expired = self
+            .inner
+            .iter()
+            .filter_map(|entry| {
+                (entry.disabled_until > 0 && entry.disabled_until <= now)
+                    .then(|| entry.key().clone())
+            })
+            .collect::<Vec<_>>();
+        for key in expired {
+            self.inner.remove(&key);
+        }
+    }
+
+    pub fn memory_usage(&self) -> RuntimeMemoryUsage {
+        let mut usage = dashmap_memory_overhead(&self.inner);
+        for entry in self.inner.iter() {
+            usage.entries += 1;
+            usage.content_bytes += entry.key().capacity();
+        }
+        usage.finish();
+        usage
+    }
+
     pub fn retain_targets(&self, models: &[ModelConfig]) {
         let valid = models
             .iter()
@@ -236,5 +261,30 @@ mod tests {
             target_breaker_policy(FailureKind::Transient, &cfg),
             Some((3, 60 * 1000))
         );
+    }
+
+    #[test]
+    fn cleanup_expired_removes_only_elapsed_open_breakers() {
+        let breakers = super::CircuitBreakers::default();
+        breakers.inner.insert(
+            "expired".to_string(),
+            super::BreakerState {
+                disabled_until: crate::stats::now_ms().saturating_sub(1),
+                ..super::BreakerState::default()
+            },
+        );
+        breakers.inner.insert(
+            "active".to_string(),
+            super::BreakerState {
+                disabled_until: crate::stats::now_ms().saturating_add(60_000),
+                ..super::BreakerState::default()
+            },
+        );
+
+        breakers.cleanup_expired();
+
+        assert!(!breakers.inner.contains_key("expired"));
+        assert!(breakers.inner.contains_key("active"));
+        assert_eq!(breakers.memory_usage().entries, 1);
     }
 }

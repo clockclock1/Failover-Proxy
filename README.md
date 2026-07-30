@@ -22,7 +22,7 @@ Failover Proxy 是一个 OpenAI 兼容的大模型故障转移代理，内置可
 - 统计与日志：总请求、成功、失败、转移次数，按模型和 target 的细粒度统计，请求日志，实时线程，进程内存占用。
 - 配置持久化：`data/config.json` 原子写入；请求日志、模型统计和运行统计分别保存到 CSV。旧 `data/stats.json` 仅用于兼容迁移，不会被修改。
 - 管理界面以内嵌多文件前端形式随服务二进制发布，无需额外前端运行时。
-- CORS、请求超时、body limit、优雅关闭和结构化日志。
+- CORS、请求超时、优雅关闭和结构化日志。
 
 ## 本地启动
 
@@ -76,7 +76,6 @@ STATS_PATH=./data/stats.json  # 仅用于兼容迁移，不会写入
 REQUEST_LOGS_PATH=./data/request-logs.csv
 MODEL_STATS_PATH=./data/model-stats.csv
 RUNTIME_STATS_PATH=./data/runtime-stats.csv
-BODY_LIMIT_MB=50
 STREAM_FAILURE_PROBE_KB=64
 RUST_LOG=failover_proxy=info,tower_http=info
 ```
@@ -284,7 +283,7 @@ Failover Proxy is an OpenAI-compatible LLM failover proxy with a visual manageme
 - Stats and logs: total requests, successes, failures, failovers, per-model and per-target stats, request logs, live threads, and process memory.
 - Config persistence: `data/config.json` is saved atomically; request logs, model stats, and runtime stats are stored as CSV files. Legacy `data/stats.json` is read only for compatibility migration and is never modified.
 - Embedded multi-file admin UI served from the service binary. No extra frontend runtime is required.
-- CORS, request timeout, body limit, graceful shutdown, and structured logging.
+- CORS, request timeout, graceful shutdown, and structured logging.
 
 ## Local Start
 
@@ -338,7 +337,6 @@ STATS_PATH=./data/stats.json  # legacy migration input only; never written
 REQUEST_LOGS_PATH=./data/request-logs.csv
 MODEL_STATS_PATH=./data/model-stats.csv
 RUNTIME_STATS_PATH=./data/runtime-stats.csv
-BODY_LIMIT_MB=50
 STREAM_FAILURE_PROBE_KB=64
 RUST_LOG=failover_proxy=info,tower_http=info
 ```

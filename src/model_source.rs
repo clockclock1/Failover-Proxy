@@ -1,4 +1,7 @@
-use crate::config::{normalize_model, Config, ModelConfig, ModelSourceConfig, TargetConfig};
+use crate::{
+    config::{normalize_model, Config, ModelConfig, ModelSourceConfig, TargetConfig},
+    stats::RuntimeMemoryUsage,
+};
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use reqwest::Client;
@@ -50,6 +53,15 @@ impl ModelSourceService {
 
     pub async fn cached_models(&self) -> Vec<ModelConfig> {
         self.cache.read().await.models.clone()
+    }
+
+    pub async fn memory_usage(&self) -> RuntimeMemoryUsage {
+        let cache = self.cache.read().await;
+        let mut usage = model_configs_memory_usage(&cache.models);
+        usage.lock_and_shard_bytes += std::mem::size_of::<RwLock<ModelSourceCache>>();
+        usage.content_bytes += cache.cache_key.capacity() + cache.error.capacity();
+        usage.finish();
+        usage
     }
 
     pub async fn runtime_models(&self, cfg: &Config) -> Vec<ModelConfig> {
@@ -145,6 +157,24 @@ impl ProviderHealthService {
         }
     }
 
+    pub async fn memory_usage(&self) -> RuntimeMemoryUsage {
+        let cache = self.cache.read().await;
+        let mut usage = RuntimeMemoryUsage {
+            entries: cache.len(),
+            capacity: Some(cache.capacity()),
+            hash_bucket_bytes: cache
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Value)>().saturating_add(1)),
+            lock_and_shard_bytes: std::mem::size_of::<RwLock<HashMap<String, Value>>>(),
+            ..RuntimeMemoryUsage::default()
+        };
+        for (key, value) in cache.iter() {
+            usage.content_bytes += key.capacity() + json_value_memory_usage(value);
+        }
+        usage.finish();
+        usage
+    }
+
     pub fn spawn_periodic_refresh(&self, config: Arc<RwLock<Config>>) {
         let service = self.clone();
         tokio::spawn(async move {
@@ -195,6 +225,51 @@ impl ProviderHealthService {
             *cache = next;
         } else {
             cache.extend(next);
+        }
+    }
+}
+
+fn model_configs_memory_usage(models: &Vec<ModelConfig>) -> RuntimeMemoryUsage {
+    let mut usage = RuntimeMemoryUsage {
+        entries: models.len(),
+        container_bytes: models.capacity() * std::mem::size_of::<ModelConfig>(),
+        ..RuntimeMemoryUsage::default()
+    };
+    for model in models {
+        usage.content_bytes += model.public_name.capacity()
+            + model
+                .source_model_name
+                .as_ref()
+                .map(String::capacity)
+                .unwrap_or(0)
+            + model.targets.capacity() * std::mem::size_of::<TargetConfig>();
+        for target in &model.targets {
+            usage.content_bytes += target.name.capacity()
+                + target.base_url.capacity()
+                + target.api_key.capacity()
+                + target.model_name.capacity()
+                + target.model_name_template.capacity()
+                + target.api_keys.capacity() * std::mem::size_of::<String>();
+            usage.estimated_bytes += target.api_keys.iter().map(String::capacity).sum::<usize>();
+        }
+    }
+    usage.finish();
+    usage
+}
+
+fn json_value_memory_usage(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(text) => text.capacity(),
+        Value::Array(items) => {
+            items.capacity() * std::mem::size_of::<Value>()
+                + items.iter().map(json_value_memory_usage).sum::<usize>()
+        }
+        Value::Object(items) => {
+            items
+                    .iter()
+                    .map(|(key, item)| key.capacity() + json_value_memory_usage(item))
+                    .sum::<usize>()
         }
     }
 }

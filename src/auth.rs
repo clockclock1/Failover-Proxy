@@ -1,4 +1,7 @@
-use crate::config::Config;
+use crate::{
+    config::Config,
+    stats::{dashmap_memory_overhead, RuntimeMemoryUsage},
+};
 use axum::http::HeaderMap;
 use constant_time_eq::constant_time_eq;
 use dashmap::DashMap;
@@ -50,6 +53,16 @@ impl AuthState {
             .take(64)
             .map(char::from)
             .collect()
+    }
+
+    pub fn memory_usage(&self) -> RuntimeMemoryUsage {
+        let mut usage = dashmap_memory_overhead(&self.sessions);
+        for session in self.sessions.iter() {
+            usage.entries += 1;
+            usage.content_bytes += session.key().capacity();
+        }
+        usage.finish();
+        usage
     }
 
     pub fn is_admin(&self, headers: &HeaderMap, cfg: &Config) -> bool {

@@ -17,7 +17,7 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 constant_time_eq = "0.3"
-dashmap = "6"
+dashmap = { version = "6", features = ["raw-api"] }
 futures-util = "0.3"
 http-body-util = "0.1"
 mime_guess = "2"

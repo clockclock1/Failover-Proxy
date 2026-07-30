@@ -3,9 +3,11 @@ use crate::config::{
     Config, LogSettingsConfig, ModelConfig, TargetConfig,
 };
 use anyhow::Result;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
+    hash::Hash,
     io::ErrorKind,
     path::PathBuf,
     sync::{
@@ -25,7 +27,55 @@ const REQUEST_LOGS_CSV_HEADER: &str =
 const MODEL_STATS_CSV_HEADER: &str =
     "channel,baseUrl,model,requests,successes,failures,lastStatus,lastError,lastLatencyMs,updatedAt\n";
 const RUNTIME_STATS_CSV_HEADER: &str =
-    "kind,key,model,target,upstreamModel,baseUrl,requests,successes,failures,failovers,ok,error,consecutiveFailures,disabledUntil,lastStatus,lastError,lastLatencyMs,avgLatencyMs\n";
+    "kind,key,model,target,upstreamModel,baseUrl,requests,successes,failures,failovers,ok,error,consecutiveFailures,disabledUntil,lastStatus,lastError,lastLatencyMs,avgLatencyMs,updatedAt\n";
+pub const HISTORICAL_STATS_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeMemoryUsage {
+    pub entries: usize,
+    pub content_bytes: usize,
+    pub hash_bucket_bytes: usize,
+    pub lock_and_shard_bytes: usize,
+    pub container_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<usize>,
+    pub estimated_bytes: usize,
+}
+
+impl RuntimeMemoryUsage {
+    pub fn finish(&mut self) {
+        self.estimated_bytes = self
+            .content_bytes
+            .saturating_add(self.hash_bucket_bytes)
+            .saturating_add(self.lock_and_shard_bytes)
+            .saturating_add(self.container_bytes);
+    }
+}
+
+/// Reports DashMap's actual reserved slots and fixed sharded-lock storage.
+/// `raw-api` is enabled solely for this read-only accounting path.
+pub fn dashmap_memory_overhead<K, V>(map: &DashMap<K, V>) -> RuntimeMemoryUsage
+where
+    K: Eq + Hash,
+{
+    let shards = map.shards();
+    let capacity = shards
+        .iter()
+        .map(|shard| shard.read().capacity())
+        .sum::<usize>();
+    let mut usage = RuntimeMemoryUsage {
+        capacity: Some(capacity),
+        // One control byte per hashbrown slot; allocator rounding is reported
+        // in the process-level remainder, not faked as exact table data.
+        hash_bucket_bytes: capacity
+            .saturating_mul(std::mem::size_of::<(K, V)>().saturating_add(1)),
+        lock_and_shard_bytes: std::mem::size_of_val(shards),
+        ..RuntimeMemoryUsage::default()
+    };
+    usage.finish();
+    usage
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -56,6 +106,7 @@ pub struct TargetStats {
     pub last_error: String,
     pub last_latency_ms: u64,
     pub avg_latency_ms: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -65,6 +116,7 @@ pub struct ChainStats {
     pub successes: u64,
     pub failures: u64,
     pub failovers: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -347,6 +399,7 @@ impl StatsStore {
                     trim_persisted_string(&failure.message)
                 };
             }
+            item.updated_at = now_ms();
             record_channel(stats, target, ok, &failure, measured);
         })
         .await;
@@ -358,6 +411,7 @@ impl StatsStore {
             if let Some(item) = stats.targets.get_mut(&key) {
                 item.consecutive_failures = 0;
                 item.disabled_until = 0;
+                item.updated_at = now_ms();
             }
         })
         .await;
@@ -367,7 +421,9 @@ impl StatsStore {
         let key = public_name.to_string();
         self.mutate(|stats| {
             stats.requests += 1;
-            stats.chains.entry(key).or_default().requests += 1;
+            let chain = stats.chains.entry(key).or_default();
+            chain.requests += 1;
+            chain.updated_at = now_ms();
         })
         .await;
     }
@@ -378,6 +434,7 @@ impl StatsStore {
             stats.successes += 1;
             let chain = stats.chains.entry(key).or_default();
             chain.successes += 1;
+            chain.updated_at = now_ms();
             if failover {
                 stats.failovers += 1;
                 chain.failovers += 1;
@@ -390,7 +447,9 @@ impl StatsStore {
         let key = public_name.to_string();
         self.mutate(|stats| {
             stats.failures += 1;
-            stats.chains.entry(key).or_default().failures += 1;
+            let chain = stats.chains.entry(key).or_default();
+            chain.failures += 1;
+            chain.updated_at = now_ms();
         })
         .await;
     }
@@ -463,7 +522,69 @@ impl StatsStore {
             .unwrap_or(0)
     }
 
-    pub async fn retain_runtime_models(&self, models: &[ModelConfig]) {
+    pub async fn model_statistics_memory_usage(&self) -> RuntimeMemoryUsage {
+        let stats = self.inner.read().await;
+        let mut usage = RuntimeMemoryUsage {
+            lock_and_shard_bytes: std::mem::size_of::<RwLock<Stats>>(),
+            ..RuntimeMemoryUsage::default()
+        };
+        for (name, item) in &stats.chains {
+            usage.entries += 1;
+            usage.content_bytes += std::mem::size_of_val(item) + name.capacity();
+        }
+        for (key, item) in &stats.targets {
+            usage.entries += 1;
+            usage.content_bytes += std::mem::size_of_val(item)
+                + key.capacity()
+                + item.model.capacity()
+                + item.target.capacity()
+                + item.upstream_model.capacity()
+                + item.base_url.capacity()
+                + item.last_error.capacity();
+        }
+        for (channel_name, channel) in &stats.channel_models {
+            usage.content_bytes += std::mem::size_of_val(channel)
+                + channel_name.capacity()
+                + channel.name.capacity()
+                + channel.base_url.capacity();
+            for (model_name, item) in &channel.models {
+                usage.entries += 1;
+                usage.content_bytes += std::mem::size_of_val(item)
+                    + model_name.capacity()
+                    + item.name.capacity()
+                    + item.last_error.capacity();
+            }
+        }
+        usage.finish();
+        usage
+    }
+
+    pub async fn request_log_memory_usage(&self) -> RuntimeMemoryUsage {
+        let stats = self.inner.read().await;
+        let mut usage = RuntimeMemoryUsage {
+            entries: stats.logs.len(),
+            container_bytes: stats.logs.capacity() * std::mem::size_of::<LogEntry>(),
+            ..RuntimeMemoryUsage::default()
+        };
+        for log in &stats.logs {
+            usage.content_bytes += log.id.capacity()
+                + log.chain_name.capacity()
+                + log.original_model.capacity()
+                + log.final_model.capacity()
+                + log.status.capacity()
+                + log.error.capacity()
+                + log.failed_models.capacity() * std::mem::size_of::<String>()
+                + log.failed_models.iter().map(String::capacity).sum::<usize>()
+                + log.failed_model_errors.capacity() * std::mem::size_of::<LogModelError>();
+            for error in &log.failed_model_errors {
+                usage.content_bytes += error.model.capacity() + error.error.capacity();
+            }
+        }
+        usage.finish();
+        usage
+    }
+
+    pub async fn cleanup_runtime_models(&self, models: &[ModelConfig]) {
         let valid_chains = models
             .iter()
             .map(|model| model.public_name.clone())
@@ -487,16 +608,20 @@ impl StatsStore {
                     .insert(channel_model_display_label(target));
             }
         }
+        let cutoff = now_ms().saturating_sub(HISTORICAL_STATS_RETENTION_MS);
         self.mutate(|stats| {
-            stats.chains.retain(|name, _| valid_chains.contains(name));
-            stats.targets.retain(|key, _| valid_targets.contains(key));
+            stats.chains.retain(|name, item| {
+                valid_chains.contains(name) || item.updated_at >= cutoff
+            });
+            stats.targets.retain(|key, item| {
+                valid_targets.contains(key) || item.updated_at >= cutoff
+            });
             stats.channel_models.retain(|channel_name, channel| {
-                let Some(valid_models) = valid_channel_models.get(channel_name) else {
-                    return false;
-                };
-                channel
-                    .models
-                    .retain(|model_name, _| valid_models.contains(model_name));
+                let valid_models = valid_channel_models.get(channel_name);
+                channel.models.retain(|model_name, item| {
+                    valid_models.is_some_and(|models| models.contains(model_name))
+                        || item.updated_at >= cutoff
+                });
                 !channel.models.is_empty()
             });
         })
@@ -912,6 +1037,7 @@ async fn save_runtime_stats_csv(path: &PathBuf, stats: &Stats) -> Result<()> {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
         ],
     );
     for (name, chain) in &stats.chains {
@@ -936,6 +1062,7 @@ async fn save_runtime_stats_csv(path: &PathBuf, stats: &Stats) -> Result<()> {
                 String::new(),
                 String::new(),
                 String::new(),
+                chain.updated_at.to_string(),
             ],
         );
     }
@@ -961,6 +1088,7 @@ async fn save_runtime_stats_csv(path: &PathBuf, stats: &Stats) -> Result<()> {
                 target.last_error.clone(),
                 target.last_latency_ms.to_string(),
                 target.avg_latency_ms.to_string(),
+                target.updated_at.to_string(),
             ],
         );
     }
@@ -996,6 +1124,7 @@ async fn load_runtime_stats_csv(path: &PathBuf) -> Result<Option<RuntimeStatsSna
                         successes: row[7].parse().unwrap_or(0),
                         failures: row[8].parse().unwrap_or(0),
                         failovers: row[9].parse().unwrap_or(0),
+                        updated_at: runtime_stats_updated_at(&row),
                     },
                 );
                 found = true;
@@ -1016,6 +1145,7 @@ async fn load_runtime_stats_csv(path: &PathBuf) -> Result<Option<RuntimeStatsSna
                         last_error: row[15].clone(),
                         last_latency_ms: row[16].parse().unwrap_or(0),
                         avg_latency_ms: row[17].parse().unwrap_or(0),
+                        updated_at: runtime_stats_updated_at(&row),
                     },
                 );
                 found = true;
@@ -1024,6 +1154,13 @@ async fn load_runtime_stats_csv(path: &PathBuf) -> Result<Option<RuntimeStatsSna
         }
     }
     Ok(found.then_some(snapshot))
+}
+
+fn runtime_stats_updated_at(row: &[String]) -> u64 {
+    row.get(18)
+        .and_then(|value| value.parse().ok())
+        .filter(|updated_at| *updated_at > 0)
+        .unwrap_or_else(now_ms)
 }
 
 async fn atomic_write(path: &PathBuf, bytes: Vec<u8>) -> Result<()> {
@@ -1303,6 +1440,13 @@ mod tests {
         assert_eq!(model_name, "openrouter|grok-4.3-high");
     }
 
+    #[test]
+    fn legacy_runtime_rows_receive_a_fresh_retention_timestamp() {
+        let before = now_ms();
+        let row = vec![String::new(); 18];
+        assert!(runtime_stats_updated_at(&row) >= before);
+    }
+
     #[tokio::test]
     async fn load_rebuilds_chain_totals_from_request_logs() -> Result<()> {
         let dir =
@@ -1365,6 +1509,7 @@ mod tests {
                 successes: 10,
                 failures: 2,
                 failovers: 3,
+                updated_at: 123,
             },
         );
         stats.targets.insert(
@@ -1382,6 +1527,7 @@ mod tests {
                 last_error: "rate limit".to_string(),
                 last_latency_ms: 120,
                 avg_latency_ms: 95,
+                updated_at: 456,
             },
         );
 
@@ -1390,6 +1536,7 @@ mod tests {
 
         assert_eq!(restored.requests, 12);
         assert_eq!(restored.chains["auto-code"].failovers, 3);
+        assert_eq!(restored.chains["auto-code"].updated_at, 123);
         assert_eq!(
             restored.targets["auto-code/provider/model/url"].last_status,
             429
@@ -1398,6 +1545,125 @@ mod tests {
             restored.targets["auto-code/provider/model/url"].last_error,
             "rate limit"
         );
+        assert_eq!(
+            restored.targets["auto-code/provider/model/url"].updated_at,
+            456
+        );
+
+        fs::remove_dir_all(&dir).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_runtime_models_keeps_active_and_recent_stats_for_one_day() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("failover-proxy-stats-cleanup-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).await?;
+        let store = StatsStore::load(
+            dir.join("stats.json"),
+            dir.join("request-logs.csv"),
+            dir.join("model-stats.csv"),
+            dir.join("runtime-stats.csv"),
+            LogSettingsConfig::default(),
+        )
+        .await?;
+        let active_model = ModelConfig {
+            public_name: "active".to_string(),
+            targets: vec![TargetConfig {
+                name: "upstream".to_string(),
+                base_url: "https://example.test/v1".to_string(),
+                model_name: "model".to_string(),
+                ..TargetConfig::default()
+            }],
+            ..ModelConfig::default()
+        };
+        let active_target = target_key(&active_model, &active_model.targets[0]);
+        let now = now_ms();
+        let stale = now.saturating_sub(HISTORICAL_STATS_RETENTION_MS + 60_000);
+        let recent = now.saturating_sub(HISTORICAL_STATS_RETENTION_MS - 60_000);
+        store
+            .mutate(|stats| {
+                stats.chains.insert(
+                    "active".to_string(),
+                    ChainStats {
+                        updated_at: 0,
+                        ..ChainStats::default()
+                    },
+                );
+                stats.chains.insert(
+                    "stale".to_string(),
+                    ChainStats {
+                        updated_at: stale,
+                        ..ChainStats::default()
+                    },
+                );
+                stats.chains.insert(
+                    "recent-history".to_string(),
+                    ChainStats {
+                        updated_at: recent,
+                        ..ChainStats::default()
+                    },
+                );
+                stats.targets.insert(
+                    active_target.clone(),
+                    TargetStats {
+                        updated_at: 0,
+                        ..TargetStats::default()
+                    },
+                );
+                stats.targets.insert(
+                    "stale-target".to_string(),
+                    TargetStats {
+                        updated_at: stale,
+                        ..TargetStats::default()
+                    },
+                );
+                record_channel(
+                    stats,
+                    &active_model.targets[0],
+                    true,
+                    &FailureInfo::default(),
+                    0,
+                );
+                let channel = stats
+                    .channel_models
+                    .get_mut(&channel_label(&active_model.targets[0]))
+                    .expect("active channel");
+                channel.models.insert(
+                    "stale-model".to_string(),
+                    ChannelModelItemStats {
+                        name: "stale-model".to_string(),
+                        updated_at: stale,
+                        ..ChannelModelItemStats::default()
+                    },
+                );
+                channel.models.insert(
+                    "recent-model".to_string(),
+                    ChannelModelItemStats {
+                        name: "recent-model".to_string(),
+                        updated_at: recent,
+                        ..ChannelModelItemStats::default()
+                    },
+                );
+            })
+            .await;
+
+        store
+            .cleanup_runtime_models(std::slice::from_ref(&active_model))
+            .await;
+        let snapshot = store.snapshot().await;
+        assert!(store.model_statistics_memory_usage().await.estimated_bytes > 0);
+        assert!(snapshot.chains.contains_key("active"));
+        assert!(snapshot.chains.contains_key("recent-history"));
+        assert!(!snapshot.chains.contains_key("stale"));
+        assert!(snapshot.targets.contains_key(&active_target));
+        assert!(!snapshot.targets.contains_key("stale-target"));
+        let channel = snapshot
+            .channel_models
+            .get(&channel_label(&active_model.targets[0]))
+            .expect("active channel");
+        assert!(!channel.models.contains_key("stale-model"));
+        assert!(channel.models.contains_key("recent-model"));
 
         fs::remove_dir_all(&dir).await?;
         Ok(())

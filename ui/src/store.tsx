@@ -88,6 +88,10 @@ interface BackendStats {
     dataBytes?: number;
     collectionError?: string | null;
   };
+  runtimeStateMemory?: Record<string, {
+    entries?: number;
+    estimatedBytes?: number;
+  } | string>;
   chains?: Record<string, {
     requests: number;
     successes: number;

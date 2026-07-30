@@ -4,7 +4,7 @@ use crate::{
         endpoint_suffix, model_circuit, target_key, target_label, trim_slashes, ApiKeyMode, Config,
         FailoverStrategy, ModelConfig, TargetConfig,
     },
-    stats::{now_ms, FailureInfo, LogEntry, LogModelError, StatsStore},
+    stats::{dashmap_memory_overhead, now_ms, FailureInfo, LogEntry, LogModelError, RuntimeMemoryUsage, StatsStore},
     AppState,
 };
 use axum::{
@@ -294,14 +294,76 @@ impl ProxyRuntime {
             .remove(&api_key_cooldown_id(model, target, api_key));
     }
 
-    pub fn retain_round_robin_models<I>(&self, model_names: I)
-    where
-        I: IntoIterator,
-        I::Item: AsRef<str>,
-    {
-        let valid = model_names
-            .into_iter()
-            .map(|name| name.as_ref().to_string())
+    pub fn cleanup_expired_api_key_cooldowns(&self) {
+        let now = now_ms();
+        let expired = self
+            .api_key_cooldowns
+            .iter()
+            .filter_map(|entry| (*entry.value() <= now).then(|| entry.key().clone()))
+            .collect::<Vec<_>>();
+        for key in expired {
+            self.api_key_cooldowns.remove(&key);
+        }
+    }
+
+    pub fn api_key_cooldown_memory_usage(&self) -> RuntimeMemoryUsage {
+        let mut usage = dashmap_memory_overhead(&self.api_key_cooldowns);
+        for entry in self.api_key_cooldowns.iter() {
+            usage.entries += 1;
+            usage.content_bytes += entry.key().capacity();
+        }
+        usage.finish();
+        usage
+    }
+
+    pub fn round_robin_memory_usage(&self) -> RuntimeMemoryUsage {
+        let mut usage = dashmap_memory_overhead(&self.round_robin);
+        for entry in self.round_robin.iter() {
+            usage.entries += 1;
+            usage.content_bytes += entry.key().capacity();
+        }
+        usage.finish();
+        usage
+    }
+
+    pub fn active_thread_memory_usage(&self) -> RuntimeMemoryUsage {
+        let mut usage = dashmap_memory_overhead(&self.active_threads);
+        for entry in self.active_threads.iter() {
+            let thread = entry.value();
+            usage.entries += 1;
+            usage.content_bytes += entry.key().capacity()
+                + thread.id.capacity()
+                + thread.chain_name.capacity()
+                + thread.requested_model.capacity()
+                + thread.target_name.capacity()
+                + thread.target_model.capacity()
+                + thread.target_base_url.capacity()
+                + thread.phase.capacity()
+                + thread.status.capacity()
+                + thread.failed_models.capacity() * std::mem::size_of::<String>()
+                + thread.failed_models.iter().map(String::capacity).sum::<usize>()
+                + thread.attempt_errors.capacity() * std::mem::size_of::<AttemptError>();
+            for error in &thread.attempt_errors {
+                usage.content_bytes += error.target.capacity()
+                    + error.message.capacity()
+                    + error.detail.as_ref().map(String::capacity).unwrap_or(0);
+            }
+        }
+        usage.finish();
+        usage
+    }
+
+    pub fn retain_round_robin_models(&self, models: &[ModelConfig]) {
+        let valid = models
+            .iter()
+            .flat_map(|model| {
+                std::iter::once(model.public_name.clone()).chain(
+                    model
+                        .targets
+                        .iter()
+                        .map(|target| format!("api-key:{}", target_key(model, target))),
+                )
+            })
             .collect::<HashSet<_>>();
         let stale = self
             .round_robin
@@ -3722,6 +3784,38 @@ mod tests {
             runtime.select_target_api_key(&model, &target, &HashSet::new()),
             Some("sk-b".to_string())
         );
+    }
+
+    #[test]
+    fn runtime_cleanup_removes_expired_key_cooldowns_and_stale_round_robin_entries() {
+        let runtime = ProxyRuntime::default();
+        let model = model();
+        let target = target();
+        runtime
+            .api_key_cooldowns
+            .insert("expired".to_string(), now_ms().saturating_sub(1));
+        runtime
+            .api_key_cooldowns
+            .insert("active".to_string(), now_ms().saturating_add(60_000));
+        runtime.cleanup_expired_api_key_cooldowns();
+        assert!(!runtime.api_key_cooldowns.contains_key("expired"));
+        assert!(runtime.api_key_cooldowns.contains_key("active"));
+        assert_eq!(runtime.api_key_cooldown_memory_usage().entries, 1);
+
+        let api_key_cursor = format!("api-key:{}", target_key(&model, &target));
+        runtime.round_robin.insert(
+            model.public_name.clone(),
+            AtomicU64::new(0),
+        );
+        runtime.round_robin.insert(api_key_cursor.clone(), AtomicU64::new(0));
+        runtime
+            .round_robin
+            .insert("removed-model".to_string(), AtomicU64::new(0));
+        runtime.retain_round_robin_models(&[model]);
+        assert!(runtime.round_robin.contains_key("public-model"));
+        assert!(runtime.round_robin.contains_key(&api_key_cursor));
+        assert!(!runtime.round_robin.contains_key("removed-model"));
+        assert_eq!(runtime.round_robin_memory_usage().entries, 2);
     }
 
     #[tokio::test]

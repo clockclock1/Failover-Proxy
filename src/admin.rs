@@ -103,10 +103,13 @@ pub async fn shared_live_status(
             None,
         );
     }
+    let memory = process_memory();
+    let runtime_state_memory = runtime_state_memory(&state, &memory).await;
     no_store(
         Json(json!({
             "activeThreads": state.proxy_runtime.snapshot_threads(),
-            "memory": process_memory(),
+            "memory": memory,
+            "runtimeStateMemory": runtime_state_memory,
         }))
         .into_response(),
     )
@@ -229,7 +232,9 @@ pub async fn get_stats(State(state): State<AppState>, headers: HeaderMap) -> Res
     let mut value =
         serde_json::to_value(state.stats.snapshot().await).unwrap_or_else(|_| json!({}));
     value["activeThreads"] = json!(state.proxy_runtime.snapshot_threads());
-    value["memory"] = process_memory();
+    let memory = process_memory();
+    value["memory"] = memory.clone();
+    value["runtimeStateMemory"] = runtime_state_memory(&state, &memory).await;
     admin_json(value)
 }
 
@@ -276,10 +281,15 @@ pub async fn get_page_stats(
                 "channelModels": stats.channel_models,
             })
         }
-        "live-status" => json!({
-            "activeThreads": state.proxy_runtime.snapshot_threads(),
-            "memory": process_memory(),
-        }),
+        "live-status" => {
+            let memory = process_memory();
+            let runtime_state_memory = runtime_state_memory(&state, &memory).await;
+            json!({
+                "activeThreads": state.proxy_runtime.snapshot_threads(),
+                "memory": memory,
+                "runtimeStateMemory": runtime_state_memory,
+            })
+        }
         "logs" => {
             let stats = state.stats.snapshot().await;
             json!({
@@ -655,12 +665,95 @@ fn merge_json(target: &mut Value, patch: Value) {
     }
 }
 
-async fn cleanup_runtime_state(state: &AppState, models: &[ModelConfig]) {
-    state
-        .proxy_runtime
-        .retain_round_robin_models(models.iter().map(|model| model.public_name.as_str()));
+pub fn spawn_runtime_state_cleanup(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cfg = state.config.read().await.clone();
+            let models = state.model_source.runtime_models(&cfg).await;
+            cleanup_runtime_state(&state, &models).await;
+        }
+    });
+}
+
+pub async fn cleanup_runtime_state(state: &AppState, models: &[ModelConfig]) {
+    state.proxy_runtime.cleanup_expired_api_key_cooldowns();
+    state.circuit_breakers.cleanup_expired();
+    state.proxy_runtime.retain_round_robin_models(models);
     state.circuit_breakers.retain_targets(models);
-    state.stats.retain_runtime_models(models).await;
+    state.stats.cleanup_runtime_models(models).await;
+}
+
+async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
+    let circuit_breakers = state.circuit_breakers.memory_usage();
+    let api_key_cooldowns = state.proxy_runtime.api_key_cooldown_memory_usage();
+    let round_robin = state.proxy_runtime.round_robin_memory_usage();
+    let model_statistics = state.stats.model_statistics_memory_usage().await;
+    let provider_health_cache = state.provider_health.memory_usage().await;
+    let model_source_cache = state.model_source.memory_usage().await;
+    let active_threads = state.proxy_runtime.active_thread_memory_usage();
+    let request_logs = state.stats.request_log_memory_usage().await;
+    let admin_sessions = state.auth.memory_usage();
+    let accounted_table_bytes = [
+        circuit_breakers.estimated_bytes,
+        api_key_cooldowns.estimated_bytes,
+        round_robin.estimated_bytes,
+        model_statistics.estimated_bytes,
+        provider_health_cache.estimated_bytes,
+        model_source_cache.estimated_bytes,
+        active_threads.estimated_bytes,
+        request_logs.estimated_bytes,
+        admin_sessions.estimated_bytes,
+    ]
+    .into_iter()
+    .sum::<usize>();
+    let (process_bytes, process_metric) = [
+        ("privateCommitBytes", "私有提交内存"),
+        ("privateResidentBytes", "私有驻留内存"),
+        ("physicalFootprintBytes", "物理足迹"),
+        ("pssBytes", "比例驻留内存"),
+        ("rssBytes", "驻留内存"),
+    ]
+    .into_iter()
+    .find_map(|(key, label)| process.get(key)?.as_u64().map(|value| (value as usize, label)))
+    .unwrap_or((0, "进程内存"));
+    json!({
+        "circuitBreakers": circuit_breakers,
+        "apiKeyCooldowns": api_key_cooldowns,
+        "roundRobin": round_robin,
+        "modelStatistics": model_statistics,
+        "providerHealthCache": provider_health_cache,
+        "modelSourceCache": model_source_cache,
+        "activeThreads": active_threads,
+        "requestLogs": request_logs,
+        "adminSessions": admin_sessions,
+        "processRemainder": {
+            "accountedTableBytes": accounted_table_bytes,
+            "processBytes": process_bytes,
+            "processMetricLabel": process_metric,
+            "unattributedBytes": process_bytes.saturating_sub(accounted_table_bytes),
+            "note": "未归类部分包括 Tokio 线程栈、代码和动态库、TLS、请求/响应体、连接池及系统或分配器保留页；它不能直接等同于内存碎片"
+        },
+        "networkBuffers": {
+            "measuredBytes": Value::Null,
+            "activeStreamCount": active_threads.entries,
+            "maxIdleConnectionsPerHost": 32,
+            "idleTimeoutSeconds": 90,
+            "note": "reqwest/hyper 没有公开每条连接的发送/接收缓冲区大小；这里显示连接池上限和当前流式请求数，不把它猜成字节数"
+        },
+        "allocator": {
+            "name": if cfg!(feature = "mimalloc") { "mimalloc" } else { "系统分配器" },
+            "fragmentationBytes": Value::Null,
+            "note": if cfg!(feature = "mimalloc") {
+                "当前构建使用 mimalloc，但未启用其统计导出接口，不能可靠拆出碎片字节"
+            } else {
+                "系统分配器未提供跨平台碎片统计；进程剩余项可用于观察总体保留内存"
+            }
+        },
+        "estimateNote": "各表已包含内容容量、哈希桶、DashMap 分片和锁的静态占用；BTreeMap 内部节点及分配器按页取整无法由 Rust 标准库精确读取"
+    })
 }
 
 fn process_memory() -> Value {
