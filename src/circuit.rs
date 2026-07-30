@@ -3,6 +3,7 @@ use crate::{
     stats::{dashmap_memory_overhead, now_ms, FailureInfo, RuntimeMemoryUsage, StatsStore},
 };
 use dashmap::DashMap;
+use serde::Serialize;
 use std::{collections::HashSet, sync::Arc};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -24,6 +25,15 @@ pub struct BreakerState {
     pub failures: u32,
     pub disabled_until: u64,
     kind: FailureKind,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCircuitBreaker {
+    pub key: String,
+    pub failures: u32,
+    pub disabled_until: u64,
+    pub failure_kind: &'static str,
 }
 
 #[derive(Clone, Default)]
@@ -168,6 +178,43 @@ impl CircuitBreakers {
         }
     }
 
+    /// Restores currently-open breakers after a process restart.  Runtime
+    /// statistics already persist the deadline and failure count; the map
+    /// itself intentionally remains an in-memory fast path.
+    pub fn restore_open_breakers<I>(&self, states: I)
+    where
+        I: IntoIterator<Item = (String, u32, u64)>,
+    {
+        let now = now_ms();
+        for (key, failures, disabled_until) in states {
+            if disabled_until > now {
+                self.inner.entry(key).or_insert(BreakerState {
+                    failures,
+                    disabled_until,
+                    kind: FailureKind::Other,
+                });
+            }
+        }
+    }
+
+    pub fn active_breakers(&self) -> Vec<OpenCircuitBreaker> {
+        let now = now_ms();
+        let mut breakers = self
+            .inner
+            .iter()
+            .filter_map(|entry| {
+                (entry.disabled_until > now).then(|| OpenCircuitBreaker {
+                    key: entry.key().clone(),
+                    failures: entry.failures,
+                    disabled_until: entry.disabled_until,
+                    failure_kind: entry.kind.label(),
+                })
+            })
+            .collect::<Vec<_>>();
+        breakers.sort_by_key(|item| item.disabled_until);
+        breakers
+    }
+
     pub fn memory_usage(&self) -> RuntimeMemoryUsage {
         let mut usage = dashmap_memory_overhead(&self.inner);
         for entry in self.inner.iter() {
@@ -202,6 +249,18 @@ impl CircuitBreakers {
             .collect::<Vec<_>>();
         for key in stale {
             self.inner.remove(&key);
+        }
+    }
+}
+
+impl FailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::RateLimited => "rate_limited",
+            Self::Compatibility => "compatibility",
+            Self::Transient => "transient",
+            Self::Other => "other",
         }
     }
 }
@@ -286,5 +345,35 @@ mod tests {
         assert!(!breakers.inner.contains_key("expired"));
         assert!(breakers.inner.contains_key("active"));
         assert_eq!(breakers.memory_usage().entries, 1);
+    }
+
+    #[test]
+    fn restore_open_breakers_keeps_only_deadlines_that_have_not_elapsed() {
+        let breakers = super::CircuitBreakers::default();
+        let now = crate::stats::now_ms();
+
+        breakers.restore_open_breakers([
+            ("still-open".to_string(), 3, now.saturating_add(60_000)),
+            ("already-expired".to_string(), 3, now.saturating_sub(1)),
+        ]);
+
+        assert!(breakers.inner.contains_key("still-open"));
+        assert!(!breakers.inner.contains_key("already-expired"));
+    }
+
+    #[test]
+    fn active_breakers_excludes_elapsed_entries() {
+        let breakers = super::CircuitBreakers::default();
+        let now = crate::stats::now_ms();
+        breakers.restore_open_breakers([
+            ("open".to_string(), 2, now.saturating_add(60_000)),
+            ("expired".to_string(), 2, now.saturating_sub(1)),
+        ]);
+
+        let active = breakers.active_breakers();
+
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].key, "open");
+        assert_eq!(active[0].failures, 2);
     }
 }

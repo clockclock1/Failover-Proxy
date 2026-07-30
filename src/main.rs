@@ -190,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/model-stats", get(admin::static_ui))
         .route("/endpoints", get(admin::static_ui))
         .route("/live-status", get(admin::static_ui))
+        .route("/circuit-breakers", get(admin::static_ui))
         .route(
             "/share/live-status/{token}",
             get(admin::live_status_share_page),

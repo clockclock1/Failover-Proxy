@@ -104,7 +104,7 @@ impl ModelSourceService {
         }
         let cache_key = source_cache_key(source);
         let max_age_ms = source.refresh_seconds.max(1) * 1000;
-        {
+        let stale_models = {
             let cache = self.cache.read().await;
             if !force
                 && cache.cache_key == cache_key
@@ -112,8 +112,20 @@ impl ModelSourceService {
             {
                 return Ok(cache.models.clone());
             }
-        }
-        let remote = fetch_model_source(&self.client, source).await?;
+            (cache.cache_key == cache_key && !cache.models.is_empty()).then(|| cache.models.clone())
+        };
+        let remote = match fetch_model_source(&self.client, source).await {
+            Ok(remote) => remote,
+            Err(err) => {
+                if let Some(models) = stale_models {
+                    // A source outage must not make currently configured
+                    // dynamic targets look deleted to the circuit cleaner.
+                    self.cache.write().await.error = err.to_string();
+                    return Ok(models);
+                }
+                return Err(err);
+            }
+        };
         let filtered = filter_source_models(remote, source);
         let generated = filtered
             .into_iter()
@@ -577,4 +589,37 @@ pub fn source_cache_key(source: &ModelSourceConfig) -> String {
         source.context_window_tokens.to_string(),
     ]
     .join("|")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_dynamic_models_are_kept_when_refresh_fails() {
+        let service = ModelSourceService::new(Client::new());
+        let mut cfg = Config::default();
+        cfg.models.clear();
+        cfg.model_source.enabled = true;
+        cfg.model_source.url = "http://127.0.0.1:1/models".to_string();
+        cfg.model_source.refresh_seconds = 1;
+        let model = ModelConfig {
+            public_name: "cached-dynamic-model".to_string(),
+            ..ModelConfig::default()
+        };
+        {
+            let mut cache = service.cache.write().await;
+            cache.cache_key = source_cache_key(&cfg.model_source);
+            cache.fetched_at = crate::stats::now_ms().saturating_sub(2_000);
+            cache.models = vec![model.clone()];
+        }
+
+        let models = service
+            .source_runtime_models(&cfg, false)
+            .await
+            .expect("a refresh failure must retain the last successful model list");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].public_name, model.public_name);
+    }
 }

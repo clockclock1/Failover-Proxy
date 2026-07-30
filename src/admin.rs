@@ -13,6 +13,7 @@ use axum::{
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
@@ -289,6 +290,10 @@ pub async fn get_page_stats(
                 "memory": memory,
                 "runtimeStateMemory": runtime_state_memory,
             })
+        }
+        "circuit-breakers" => {
+            let breakers = active_circuit_breakers(&state, &cfg).await;
+            json!({ "circuitBreakers": breakers })
         }
         "logs" => {
             let stats = state.stats.snapshot().await;
@@ -669,8 +674,18 @@ pub fn spawn_runtime_state_cleanup(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut restored_breakers = false;
         loop {
             interval.tick().await;
+            if !restored_breakers {
+                let stats = state.stats.snapshot().await;
+                state.circuit_breakers.restore_open_breakers(
+                    stats.targets.into_iter().map(|(key, target)| {
+                        (key, target.consecutive_failures, target.disabled_until)
+                    }),
+                );
+                restored_breakers = true;
+            }
             let cfg = state.config.read().await.clone();
             let models = state.model_source.runtime_models(&cfg).await;
             cleanup_runtime_state(&state, &models).await;
@@ -682,7 +697,6 @@ pub async fn cleanup_runtime_state(state: &AppState, models: &[ModelConfig]) {
     state.proxy_runtime.cleanup_expired_api_key_cooldowns();
     state.circuit_breakers.cleanup_expired();
     state.proxy_runtime.retain_round_robin_models(models);
-    state.circuit_breakers.retain_targets(models);
     state.stats.cleanup_runtime_models(models).await;
 }
 
@@ -754,6 +768,51 @@ async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
         },
         "estimateNote": "各表已包含内容容量、哈希桶、DashMap 分片和锁的静态占用；BTreeMap 内部节点及分配器按页取整无法由 Rust 标准库精确读取"
     })
+}
+
+async fn active_circuit_breakers(state: &AppState, cfg: &Config) -> Vec<Value> {
+    let models = state.model_source.runtime_models(cfg).await;
+    let targets = models
+        .iter()
+        .flat_map(|model| {
+            model.targets.iter().map(move |target| {
+                (
+                    crate::config::target_key(model, target),
+                    json!({
+                        "model": model.public_name,
+                        "targetName": target.name,
+                        "targetModel": target.model_name,
+                        "targetBaseUrl": target.base_url,
+                    }),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    state
+        .circuit_breakers
+        .active_breakers()
+        .into_iter()
+        .map(|breaker| {
+            let target = targets.get(&breaker.key).cloned().unwrap_or_else(|| {
+                json!({
+                    "model": "已不在当前模型列表中",
+                    "targetName": "-",
+                    "targetModel": "-",
+                    "targetBaseUrl": "",
+                })
+            });
+            json!({
+                "key": breaker.key,
+                "failures": breaker.failures,
+                "disabledUntil": breaker.disabled_until,
+                "failureKind": breaker.failure_kind,
+                "model": target["model"],
+                "targetName": target["targetName"],
+                "targetModel": target["targetModel"],
+                "targetBaseUrl": target["targetBaseUrl"],
+            })
+        })
+        .collect()
 }
 
 fn process_memory() -> Value {
