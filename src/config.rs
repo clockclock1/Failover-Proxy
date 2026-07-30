@@ -39,13 +39,6 @@ pub struct CircuitBreakerConfig {
     pub rate_limit_key_cooldown_seconds: u64,
     /// Per-key cooldown after a credential/authentication failure (401/403).
     pub auth_key_cooldown_minutes: u64,
-    /// Consecutive transport, timeout, and 5xx failures before opening a
-    /// target-level breaker.
-    pub transient_failure_threshold: u32,
-    /// Target-level breaker duration for transient failures.
-    pub transient_cooldown_seconds: u64,
-    /// Target-level breaker duration for endpoint/protocol incompatibility.
-    pub compatibility_cooldown_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,9 +188,6 @@ impl Default for CircuitBreakerConfig {
             cooldown_minutes: 10,
             rate_limit_key_cooldown_seconds: 60,
             auth_key_cooldown_minutes: 30,
-            transient_failure_threshold: 3,
-            transient_cooldown_seconds: 60,
-            compatibility_cooldown_minutes: 10,
         }
     }
 }
@@ -377,15 +367,6 @@ pub fn normalize_circuit(mut breaker: CircuitBreakerConfig) -> CircuitBreakerCon
     if breaker.auth_key_cooldown_minutes == 0 {
         breaker.auth_key_cooldown_minutes = 30;
     }
-    if breaker.transient_failure_threshold == 0 {
-        breaker.transient_failure_threshold = 3;
-    }
-    if breaker.transient_cooldown_seconds == 0 {
-        breaker.transient_cooldown_seconds = 60;
-    }
-    if breaker.compatibility_cooldown_minutes == 0 {
-        breaker.compatibility_cooldown_minutes = 10;
-    }
     breaker
 }
 
@@ -509,9 +490,6 @@ pub fn model_circuit(model: &ModelConfig, cfg: &Config) -> CircuitBreakerConfig 
     breaker.cooldown_minutes = model_breaker.cooldown_minutes;
     breaker.rate_limit_key_cooldown_seconds = model_breaker.rate_limit_key_cooldown_seconds;
     breaker.auth_key_cooldown_minutes = model_breaker.auth_key_cooldown_minutes;
-    breaker.transient_failure_threshold = model_breaker.transient_failure_threshold;
-    breaker.transient_cooldown_seconds = model_breaker.transient_cooldown_seconds;
-    breaker.compatibility_cooldown_minutes = model_breaker.compatibility_cooldown_minutes;
     normalize_circuit(breaker)
 }
 
@@ -576,7 +554,7 @@ pub fn provider_name_from_url(url: &str) -> Option<String> {
 mod tests {
     use super::{
         endpoint_suffix, normalize_model, normalize_model_source, normalize_targets, target_label,
-        ApiKeyMode, ModelConfig, ModelSourceConfig, TargetConfig,
+        ApiKeyMode, Config, ModelConfig, ModelSourceConfig, TargetConfig,
         DEFAULT_PROXY_CONTEXT_WINDOW_TOKENS,
     };
 
@@ -637,5 +615,25 @@ mod tests {
             source.context_window_tokens,
             DEFAULT_PROXY_CONTEXT_WINDOW_TOKENS
         );
+    }
+
+    #[test]
+    fn legacy_breaker_fields_are_ignored_when_loading_and_removed_when_saving() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "circuitBreaker": {
+                "failureThreshold": 4,
+                "transientFailureThreshold": 9,
+                "transientCooldownSeconds": 99,
+                "compatibilityCooldownMinutes": 99
+            }
+        }))
+        .expect("legacy config remains readable");
+
+        assert_eq!(config.circuit_breaker.failure_threshold, 4);
+        let serialized = serde_json::to_value(config).expect("config serializes");
+        let breaker = &serialized["circuitBreaker"];
+        assert!(breaker.get("transientFailureThreshold").is_none());
+        assert!(breaker.get("transientCooldownSeconds").is_none());
+        assert!(breaker.get("compatibilityCooldownMinutes").is_none());
     }
 }

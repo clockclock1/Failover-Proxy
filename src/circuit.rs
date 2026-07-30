@@ -14,8 +14,6 @@ enum FailureKind {
     RateLimited,
     /// The upstream endpoint does not support the requested protocol.
     Compatibility,
-    /// Timeouts, connection errors, and server-side failures.
-    Transient,
     #[default]
     Other,
 }
@@ -259,7 +257,6 @@ impl FailureKind {
             Self::Authentication => "authentication",
             Self::RateLimited => "rate_limited",
             Self::Compatibility => "compatibility",
-            Self::Transient => "transient",
             Self::Other => "other",
         }
     }
@@ -270,8 +267,6 @@ fn classify_failure_kind(failure: &FailureInfo) -> FailureKind {
         401 | 403 => FailureKind::Authentication,
         429 => FailureKind::RateLimited,
         404 | 405 | 406 | 415 | 501 => FailureKind::Compatibility,
-        0 | 408 | 409 | 500 | 502 | 503 | 504 => FailureKind::Transient,
-        status if status >= 500 => FailureKind::Transient,
         _ => FailureKind::Other,
     }
 }
@@ -279,11 +274,9 @@ fn classify_failure_kind(failure: &FailureInfo) -> FailureKind {
 fn target_breaker_policy(kind: FailureKind, cfg: &CircuitBreakerConfig) -> Option<(u32, u64)> {
     match kind {
         FailureKind::Authentication | FailureKind::RateLimited => None,
-        FailureKind::Compatibility => Some((1, cfg.compatibility_cooldown_minutes * 60 * 1000)),
-        FailureKind::Transient => Some((
-            cfg.transient_failure_threshold,
-            cfg.transient_cooldown_seconds * 1000,
-        )),
+        // Unsupported endpoint/protocol combinations should stop immediately,
+        // while sharing the regular user-configured disable duration.
+        FailureKind::Compatibility => Some((1, cfg.cooldown_minutes * 60 * 1000)),
         FailureKind::Other => Some((cfg.failure_threshold, cfg.cooldown_minutes * 60 * 1000)),
     }
 }
@@ -310,16 +303,30 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_opens_immediately_but_transient_uses_own_threshold() {
+    fn special_compatibility_failure_opens_immediately_and_other_failures_use_general_policy() {
         let cfg = CircuitBreakerConfig::default();
         assert_eq!(
             target_breaker_policy(FailureKind::Compatibility, &cfg),
             Some((1, 10 * 60 * 1000))
         );
         assert_eq!(
-            target_breaker_policy(FailureKind::Transient, &cfg),
-            Some((3, 60 * 1000))
+            target_breaker_policy(FailureKind::Other, &cfg),
+            Some((3, 10 * 60 * 1000))
         );
+    }
+
+    #[test]
+    fn timeouts_and_server_failures_use_the_general_failure_bucket() {
+        for status in [0, 408, 409, 500, 502, 503, 504] {
+            assert_eq!(
+                classify_failure_kind(&FailureInfo {
+                    status,
+                    ..FailureInfo::default()
+                }),
+                FailureKind::Other,
+                "status {status} should use the general breaker policy"
+            );
+        }
     }
 
     #[test]
