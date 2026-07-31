@@ -694,7 +694,6 @@ pub fn spawn_runtime_state_cleanup(state: AppState) {
 }
 
 pub async fn cleanup_runtime_state(state: &AppState, models: &[ModelConfig]) {
-    state.proxy_runtime.cleanup_expired_api_key_cooldowns();
     state.circuit_breakers.cleanup_expired();
     state.proxy_runtime.retain_round_robin_models(models);
     state.stats.cleanup_runtime_models(models).await;
@@ -702,7 +701,6 @@ pub async fn cleanup_runtime_state(state: &AppState, models: &[ModelConfig]) {
 
 async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
     let circuit_breakers = state.circuit_breakers.memory_usage();
-    let api_key_cooldowns = state.proxy_runtime.api_key_cooldown_memory_usage();
     let round_robin = state.proxy_runtime.round_robin_memory_usage();
     let model_statistics = state.stats.model_statistics_memory_usage().await;
     let provider_health_cache = state.provider_health.memory_usage().await;
@@ -712,7 +710,6 @@ async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
     let admin_sessions = state.auth.memory_usage();
     let accounted_table_bytes = [
         circuit_breakers.estimated_bytes,
-        api_key_cooldowns.estimated_bytes,
         round_robin.estimated_bytes,
         model_statistics.estimated_bytes,
         provider_health_cache.estimated_bytes,
@@ -735,7 +732,6 @@ async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
     .unwrap_or((0, "进程内存"));
     json!({
         "circuitBreakers": circuit_breakers,
-        "apiKeyCooldowns": api_key_cooldowns,
         "roundRobin": round_robin,
         "modelStatistics": model_statistics,
         "providerHealthCache": provider_health_cache,

@@ -34,11 +34,6 @@ pub struct ProxyKey {
 pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     pub cooldown_minutes: u64,
-    /// Per-key cooldown after a 429.  This deliberately does not open the
-    /// whole target: another credential may still have quota available.
-    pub rate_limit_key_cooldown_seconds: u64,
-    /// Per-key cooldown after a credential/authentication failure (401/403).
-    pub auth_key_cooldown_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,8 +181,6 @@ impl Default for CircuitBreakerConfig {
         Self {
             failure_threshold: 3,
             cooldown_minutes: 10,
-            rate_limit_key_cooldown_seconds: 60,
-            auth_key_cooldown_minutes: 30,
         }
     }
 }
@@ -361,12 +354,6 @@ pub fn normalize_circuit(mut breaker: CircuitBreakerConfig) -> CircuitBreakerCon
     if breaker.cooldown_minutes == 0 {
         breaker.cooldown_minutes = 10;
     }
-    if breaker.rate_limit_key_cooldown_seconds == 0 {
-        breaker.rate_limit_key_cooldown_seconds = 60;
-    }
-    if breaker.auth_key_cooldown_minutes == 0 {
-        breaker.auth_key_cooldown_minutes = 30;
-    }
     breaker
 }
 
@@ -488,8 +475,6 @@ pub fn model_circuit(model: &ModelConfig, cfg: &Config) -> CircuitBreakerConfig 
     let model_breaker = &model.circuit_breaker;
     breaker.failure_threshold = model_breaker.failure_threshold;
     breaker.cooldown_minutes = model_breaker.cooldown_minutes;
-    breaker.rate_limit_key_cooldown_seconds = model_breaker.rate_limit_key_cooldown_seconds;
-    breaker.auth_key_cooldown_minutes = model_breaker.auth_key_cooldown_minutes;
     normalize_circuit(breaker)
 }
 
@@ -622,6 +607,8 @@ mod tests {
         let config: Config = serde_json::from_value(serde_json::json!({
             "circuitBreaker": {
                 "failureThreshold": 4,
+                "rateLimitKeyCooldownSeconds": 60,
+                "authKeyCooldownMinutes": 30,
                 "transientFailureThreshold": 9,
                 "transientCooldownSeconds": 99,
                 "compatibilityCooldownMinutes": 99
@@ -632,6 +619,8 @@ mod tests {
         assert_eq!(config.circuit_breaker.failure_threshold, 4);
         let serialized = serde_json::to_value(config).expect("config serializes");
         let breaker = &serialized["circuitBreaker"];
+        assert!(breaker.get("rateLimitKeyCooldownSeconds").is_none());
+        assert!(breaker.get("authKeyCooldownMinutes").is_none());
         assert!(breaker.get("transientFailureThreshold").is_none());
         assert!(breaker.get("transientCooldownSeconds").is_none());
         assert!(breaker.get("compatibilityCooldownMinutes").is_none());

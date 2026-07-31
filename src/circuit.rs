@@ -8,14 +8,8 @@ use std::{collections::HashSet, sync::Arc};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 enum FailureKind {
-    /// A bad or exhausted credential is isolated at the API-key layer.
-    Authentication,
-    /// A 429 is isolated at the API-key layer so sibling keys can continue.
-    RateLimited,
-    /// The upstream endpoint does not support the requested protocol.
-    Compatibility,
     #[default]
-    Other,
+    Failure,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,17 +110,7 @@ impl CircuitBreakers {
         let key = target_key(model, target);
         let breaker_cfg = model_circuit(model, cfg);
         let kind = classify_failure_kind(&failure);
-        let Some((failure_threshold, cooldown_ms)) = target_breaker_policy(kind, &breaker_cfg)
-        else {
-            // Authentication and rate-limit failures are scoped to the API
-            // key by ProxyRuntime.  Never let one exhausted/bad key poison a
-            // target that may contain several healthy credentials.
-            self.inner.remove(&key);
-            stats
-                .record_target(model, target, false, cfg, failure, latency_ms, 0, 0)
-                .await;
-            return;
-        };
+        let (failure_threshold, cooldown_ms) = target_breaker_policy(&breaker_cfg);
         let mut state = self.inner.entry(key).or_default();
         if state.kind != kind {
             state.failures = 0;
@@ -189,7 +173,7 @@ impl CircuitBreakers {
                 self.inner.entry(key).or_insert(BreakerState {
                     failures,
                     disabled_until,
-                    kind: FailureKind::Other,
+                    kind: FailureKind::Failure,
                 });
             }
         }
@@ -254,31 +238,17 @@ impl CircuitBreakers {
 impl FailureKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Authentication => "authentication",
-            Self::RateLimited => "rate_limited",
-            Self::Compatibility => "compatibility",
-            Self::Other => "other",
+            Self::Failure => "failure",
         }
     }
 }
 
-fn classify_failure_kind(failure: &FailureInfo) -> FailureKind {
-    match failure.status {
-        401 | 403 => FailureKind::Authentication,
-        429 => FailureKind::RateLimited,
-        404 | 405 | 406 | 415 | 501 => FailureKind::Compatibility,
-        _ => FailureKind::Other,
-    }
+fn classify_failure_kind(_: &FailureInfo) -> FailureKind {
+    FailureKind::Failure
 }
 
-fn target_breaker_policy(kind: FailureKind, cfg: &CircuitBreakerConfig) -> Option<(u32, u64)> {
-    match kind {
-        FailureKind::Authentication | FailureKind::RateLimited => None,
-        // Unsupported endpoint/protocol combinations should stop immediately,
-        // while sharing the regular user-configured disable duration.
-        FailureKind::Compatibility => Some((1, cfg.cooldown_minutes * 60 * 1000)),
-        FailureKind::Other => Some((cfg.failure_threshold, cfg.cooldown_minutes * 60 * 1000)),
-    }
+fn target_breaker_policy(cfg: &CircuitBreakerConfig) -> (u32, u64) {
+    (cfg.failure_threshold, cfg.cooldown_minutes * 60 * 1000)
 }
 
 #[cfg(test)]
@@ -287,44 +257,23 @@ mod tests {
     use crate::{config::CircuitBreakerConfig, stats::FailureInfo};
 
     #[test]
-    fn isolates_key_scoped_failures_from_target_breaker() {
-        assert_eq!(
-            classify_failure_kind(&FailureInfo {
-                status: 429,
-                ..FailureInfo::default()
-            }),
-            FailureKind::RateLimited
-        );
-        assert!(target_breaker_policy(
-            FailureKind::Authentication,
-            &CircuitBreakerConfig::default(),
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn special_compatibility_failure_opens_immediately_and_other_failures_use_general_policy() {
+    fn every_failure_uses_one_general_breaker_policy() {
         let cfg = CircuitBreakerConfig::default();
-        assert_eq!(
-            target_breaker_policy(FailureKind::Compatibility, &cfg),
-            Some((1, 10 * 60 * 1000))
-        );
-        assert_eq!(
-            target_breaker_policy(FailureKind::Other, &cfg),
-            Some((3, 10 * 60 * 1000))
-        );
+        assert_eq!(target_breaker_policy(&cfg), (3, 10 * 60 * 1000));
     }
 
     #[test]
-    fn timeouts_and_server_failures_use_the_general_failure_bucket() {
-        for status in [0, 408, 409, 500, 502, 503, 504] {
+    fn every_status_uses_the_same_failure_bucket() {
+        for status in [
+            0, 400, 401, 403, 404, 408, 409, 429, 500, 501, 502, 503, 504,
+        ] {
             assert_eq!(
                 classify_failure_kind(&FailureInfo {
                     status,
                     ..FailureInfo::default()
                 }),
-                FailureKind::Other,
-                "status {status} should use the general breaker policy"
+                FailureKind::Failure,
+                "status {status} should use the shared breaker policy"
             );
         }
     }

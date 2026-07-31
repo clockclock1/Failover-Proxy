@@ -1,7 +1,7 @@
 use crate::{
     auth,
     config::{
-        endpoint_suffix, model_circuit, target_key, target_label, trim_slashes, ApiKeyMode, Config,
+        endpoint_suffix, target_key, target_label, trim_slashes, ApiKeyMode, Config,
         FailoverStrategy, ModelConfig, TargetConfig,
     },
     stats::{dashmap_memory_overhead, now_ms, FailureInfo, LogEntry, LogModelError, RuntimeMemoryUsage, StatsStore},
@@ -19,9 +19,8 @@ use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{hash_map::DefaultHasher, HashSet},
+    collections::HashSet,
     convert::Infallible,
-    hash::{Hash, Hasher},
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -34,8 +33,6 @@ use std::{
 enum ProxyCallError {
     #[error("timeout")]
     Timeout,
-    #[error("all API keys for this target are cooling down")]
-    KeysCoolingDown,
     #[error(transparent)]
     Request(#[from] reqwest::Error),
 }
@@ -82,14 +79,12 @@ impl ProxyEndpoint {
 struct CompatibleUpstream {
     response: reqwest::Response,
     endpoint: ProxyEndpoint,
-    api_key: String,
 }
 
 impl ProxyCallError {
     fn is_timeout(&self) -> bool {
         match self {
             Self::Timeout => true,
-            Self::KeysCoolingDown => false,
             Self::Request(err) => err.is_timeout(),
         }
     }
@@ -97,7 +92,6 @@ impl ProxyCallError {
     fn status(&self) -> u16 {
         match self {
             Self::Timeout => 504,
-            Self::KeysCoolingDown => 429,
             Self::Request(_) => 0,
         }
     }
@@ -106,7 +100,6 @@ impl ProxyCallError {
 #[derive(Clone, Default)]
 pub struct ProxyRuntime {
     round_robin: Arc<DashMap<String, AtomicU64>>,
-    api_key_cooldowns: Arc<DashMap<String, u64>>,
     active_threads: Arc<DashMap<String, ActiveThread>>,
     thread_seq: Arc<AtomicU64>,
 }
@@ -217,22 +210,13 @@ impl ProxyRuntime {
         });
     }
 
-    fn select_target_api_key(
-        &self,
-        model: &ModelConfig,
-        target: &TargetConfig,
-        excluded: &HashSet<String>,
-    ) -> Option<String> {
+    fn select_target_api_key(&self, model: &ModelConfig, target: &TargetConfig) -> Option<String> {
         let keys = target_api_keys(target);
-        let available = keys
-            .into_iter()
-            .filter(|key| !excluded.contains(key) && self.is_api_key_available(model, target, key))
-            .collect::<Vec<_>>();
-        if available.is_empty() {
+        if keys.is_empty() {
             return None;
         }
-        if available.len() == 1 {
-            return available.into_iter().next();
+        if keys.len() == 1 {
+            return keys.into_iter().next();
         }
         match target.api_key_mode {
             ApiKeyMode::RoundRobin => {
@@ -242,78 +226,14 @@ impl ProxyRuntime {
                     .entry(cursor_key)
                     .or_insert_with(|| AtomicU64::new(0))
                     .fetch_add(1, AtomicOrdering::Relaxed) as usize;
-                Some(available[cursor % available.len()].clone())
+                Some(keys[cursor % keys.len()].clone())
             }
             ApiKeyMode::Random => {
-                let idx = rand::random::<usize>() % available.len();
-                Some(available[idx].clone())
+                let idx = rand::random::<usize>() % keys.len();
+                Some(keys[idx].clone())
             }
-            ApiKeyMode::Single => Some(available[0].clone()),
+            ApiKeyMode::Single => Some(keys[0].clone()),
         }
-    }
-
-    fn is_api_key_available(
-        &self,
-        model: &ModelConfig,
-        target: &TargetConfig,
-        api_key: &str,
-    ) -> bool {
-        let id = api_key_cooldown_id(model, target, api_key);
-        let Some(until) = self.api_key_cooldowns.get(&id).map(|entry| *entry) else {
-            return true;
-        };
-        if now_ms() < until {
-            return false;
-        }
-        self.api_key_cooldowns.remove(&id);
-        true
-    }
-
-    fn record_api_key_failure(
-        &self,
-        model: &ModelConfig,
-        target: &TargetConfig,
-        api_key: &str,
-        status: u16,
-        cfg: &Config,
-    ) {
-        let breaker = model_circuit(model, cfg);
-        let cooldown_ms = match status {
-            429 => breaker.rate_limit_key_cooldown_seconds.saturating_mul(1000),
-            401 | 403 => breaker.auth_key_cooldown_minutes.saturating_mul(60 * 1000),
-            _ => return,
-        };
-        self.api_key_cooldowns.insert(
-            api_key_cooldown_id(model, target, api_key),
-            now_ms().saturating_add(cooldown_ms),
-        );
-    }
-
-    fn record_api_key_success(&self, model: &ModelConfig, target: &TargetConfig, api_key: &str) {
-        self.api_key_cooldowns
-            .remove(&api_key_cooldown_id(model, target, api_key));
-    }
-
-    pub fn cleanup_expired_api_key_cooldowns(&self) {
-        let now = now_ms();
-        let expired = self
-            .api_key_cooldowns
-            .iter()
-            .filter_map(|entry| (*entry.value() <= now).then(|| entry.key().clone()))
-            .collect::<Vec<_>>();
-        for key in expired {
-            self.api_key_cooldowns.remove(&key);
-        }
-    }
-
-    pub fn api_key_cooldown_memory_usage(&self) -> RuntimeMemoryUsage {
-        let mut usage = dashmap_memory_overhead(&self.api_key_cooldowns);
-        for entry in self.api_key_cooldowns.iter() {
-            usage.entries += 1;
-            usage.content_bytes += entry.key().capacity();
-        }
-        usage.finish();
-        usage
     }
 
     pub fn round_robin_memory_usage(&self) -> RuntimeMemoryUsage {
@@ -380,14 +300,6 @@ impl ProxyRuntime {
             self.round_robin.remove(&key);
         }
     }
-}
-
-fn api_key_cooldown_id(model: &ModelConfig, target: &TargetConfig, api_key: &str) -> String {
-    // Do not retain raw credentials in diagnostics or map keys.  The hash is
-    // only an in-process discriminator and is not used as a security boundary.
-    let mut hasher = DefaultHasher::new();
-    api_key.hash(&mut hasher);
-    format!("{}:{:x}", target_key(model, target), hasher.finish())
 }
 
 impl Drop for ProxySlot {
@@ -699,7 +611,6 @@ async fn proxy_loop(
             let CompatibleUpstream {
                 response: upstream,
                 endpoint: used_endpoint,
-                api_key,
             } = upstream;
             let status = upstream.status();
             let response_type = upstream
@@ -715,20 +626,6 @@ async fn proxy_loop(
                     }
                     .to_string()
                 });
-
-            if status.is_success() {
-                state
-                    .proxy_runtime
-                    .record_api_key_success(model, &target, &api_key);
-            } else {
-                state.proxy_runtime.record_api_key_failure(
-                    model,
-                    &target,
-                    &api_key,
-                    status.as_u16(),
-                    cfg,
-                );
-            }
 
             if !status.is_success() {
                 let text = upstream.text().await.unwrap_or_default();
@@ -1318,73 +1215,43 @@ async fn call_target(
 ) -> Result<CompatibleUpstream, ProxyCallError> {
     let timeout = target_timeout(target, cfg);
     let candidates = requested_endpoint.candidates();
-    let mut attempted_keys = HashSet::new();
-    'api_keys: loop {
-        let api_key = state
-            .proxy_runtime
-            .select_target_api_key(model, target, &attempted_keys)
-            .ok_or(ProxyCallError::KeysCoolingDown)?;
-        attempted_keys.insert(api_key.clone());
-        for (idx, endpoint) in candidates.into_iter().enumerate() {
-            let upstream_stream = is_stream && endpoint == requested_endpoint;
-            let next_body =
-                build_upstream_body(body, target, requested_endpoint, endpoint, upstream_stream);
-            let mut req = state
-                .client
-                .post(upstream_endpoint_url(target, endpoint))
-                .header(header::CONTENT_TYPE, "application/json")
-                .bearer_auth(&api_key)
-                .body(serde_json::to_vec(&next_body).unwrap_or_default());
-            if let Some(value) = inbound_headers.get("openai-organization") {
-                req = req.header("openai-organization", value);
-            }
-            if let Some(value) = inbound_headers.get("openai-project") {
-                req = req.header("openai-project", value);
-            }
-            let response = if upstream_stream {
-                match tokio::time::timeout(timeout, req.send()).await {
-                    Ok(result) => result?,
-                    Err(_) => return Err(ProxyCallError::Timeout),
-                }
-            } else {
-                req.timeout(timeout).send().await?
-            };
-            if matches!(response.status().as_u16(), 401 | 403 | 429)
-                && target.api_key_mode != ApiKeyMode::Single
-            {
-                state.proxy_runtime.record_api_key_failure(
-                    model,
-                    target,
-                    &api_key,
-                    response.status().as_u16(),
-                    cfg,
-                );
-                if state
-                    .proxy_runtime
-                    .select_target_api_key(model, target, &attempted_keys)
-                    .is_some()
-                {
-                    continue 'api_keys;
-                }
-            }
-            if response.status().is_success() || idx == 2 {
-                return Ok(CompatibleUpstream {
-                    response,
-                    endpoint,
-                    api_key,
-                });
-            }
-            if is_endpoint_unsupported_status(response.status()) {
-                continue;
-            }
-            return Ok(CompatibleUpstream {
-                response,
-                endpoint,
-                api_key,
-            });
+    let api_key = state
+        .proxy_runtime
+        .select_target_api_key(model, target)
+        .expect("enabled targets always have at least one API key");
+    for (idx, endpoint) in candidates.into_iter().enumerate() {
+        let upstream_stream = is_stream && endpoint == requested_endpoint;
+        let next_body =
+            build_upstream_body(body, target, requested_endpoint, endpoint, upstream_stream);
+        let mut req = state
+            .client
+            .post(upstream_endpoint_url(target, endpoint))
+            .header(header::CONTENT_TYPE, "application/json")
+            .bearer_auth(&api_key)
+            .body(serde_json::to_vec(&next_body).unwrap_or_default());
+        if let Some(value) = inbound_headers.get("openai-organization") {
+            req = req.header("openai-organization", value);
         }
-        unreachable!("endpoint candidate list is non-empty")
+        if let Some(value) = inbound_headers.get("openai-project") {
+            req = req.header("openai-project", value);
+        }
+        let response = if upstream_stream {
+            match tokio::time::timeout(timeout, req.send()).await {
+                Ok(result) => result?,
+                Err(_) => return Err(ProxyCallError::Timeout),
+            }
+        } else {
+            req.timeout(timeout).send().await?
+        };
+        if response.status().is_success() || idx == 2 {
+            return Ok(CompatibleUpstream { response, endpoint });
+        }
+        if is_endpoint_unsupported_status(response.status()) {
+            continue;
+        }
+        return Ok(CompatibleUpstream { response, endpoint });
     }
+    unreachable!("endpoint candidate list is non-empty")
 }
 
 fn compact_request_context(body: &Value, requested: ProxyEndpoint) -> Option<Value> {
@@ -3293,7 +3160,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use reqwest::Client;
-    use std::{collections::HashSet, path::PathBuf, sync::Arc};
+    use std::{path::PathBuf, sync::Arc};
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
@@ -3756,58 +3623,31 @@ mod tests {
         target.api_key_mode = ApiKeyMode::RoundRobin;
 
         assert_eq!(
-            runtime.select_target_api_key(&model, &target, &HashSet::new()),
+            runtime.select_target_api_key(&model, &target),
             Some("sk-a".to_string())
         );
         assert_eq!(
-            runtime.select_target_api_key(&model, &target, &HashSet::new()),
+            runtime.select_target_api_key(&model, &target),
             Some("sk-b".to_string())
         );
         assert_eq!(
-            runtime.select_target_api_key(&model, &target, &HashSet::new()),
+            runtime.select_target_api_key(&model, &target),
             Some("sk-a".to_string())
         );
     }
 
     #[test]
-    fn rate_limited_key_is_skipped_without_disabling_its_sibling_key() {
-        let runtime = ProxyRuntime::default();
-        let model = model();
-        let mut target = target();
-        target.api_key = "sk-a".to_string();
-        target.api_keys = vec!["sk-a".to_string(), "sk-b".to_string()];
-        target.api_key_mode = ApiKeyMode::RoundRobin;
-
-        runtime.record_api_key_failure(&model, &target, "sk-a", 429, &Config::default());
-
-        assert_eq!(
-            runtime.select_target_api_key(&model, &target, &HashSet::new()),
-            Some("sk-b".to_string())
-        );
-    }
-
-    #[test]
-    fn runtime_cleanup_removes_expired_key_cooldowns_and_stale_round_robin_entries() {
+    fn runtime_cleanup_removes_stale_round_robin_entries() {
         let runtime = ProxyRuntime::default();
         let model = model();
         let target = target();
-        runtime
-            .api_key_cooldowns
-            .insert("expired".to_string(), now_ms().saturating_sub(1));
-        runtime
-            .api_key_cooldowns
-            .insert("active".to_string(), now_ms().saturating_add(60_000));
-        runtime.cleanup_expired_api_key_cooldowns();
-        assert!(!runtime.api_key_cooldowns.contains_key("expired"));
-        assert!(runtime.api_key_cooldowns.contains_key("active"));
-        assert_eq!(runtime.api_key_cooldown_memory_usage().entries, 1);
-
         let api_key_cursor = format!("api-key:{}", target_key(&model, &target));
-        runtime.round_robin.insert(
-            model.public_name.clone(),
-            AtomicU64::new(0),
-        );
-        runtime.round_robin.insert(api_key_cursor.clone(), AtomicU64::new(0));
+        runtime
+            .round_robin
+            .insert(model.public_name.clone(), AtomicU64::new(0));
+        runtime
+            .round_robin
+            .insert(api_key_cursor.clone(), AtomicU64::new(0));
         runtime
             .round_robin
             .insert("removed-model".to_string(), AtomicU64::new(0));
