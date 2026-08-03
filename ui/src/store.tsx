@@ -149,6 +149,7 @@ type Action =
   | { type: 'ADD_CHAIN'; chain: FailoverChain }
   | { type: 'UPDATE_CHAIN'; chain: FailoverChain }
   | { type: 'DELETE_CHAIN'; id: string }
+  | { type: 'SYNC_CHAIN_MODELS'; id: string }
   | { type: 'ADD_LOG'; log: LogEntry }
   | { type: 'SET_LOG_SETTINGS'; settings: LogSettings };
 
@@ -398,6 +399,17 @@ function reducer(state: State, action: Action): State {
       return markConfigChanged(state, { chains: state.chains.map(c => c.id === action.chain.id ? normalizeChain(action.chain) : c) });
     case 'DELETE_CHAIN':
       return markConfigChanged(state, { chains: state.chains.filter(c => c.id !== action.id) });
+    case 'SYNC_CHAIN_MODELS': {
+      const synchronizedChain = synchronizeChainModelsWithProviders(state.chains, state.providers)
+        .find(chain => chain.id === action.id);
+      const currentChain = state.chains.find(chain => chain.id === action.id);
+      if (!synchronizedChain || !currentChain || synchronizedChain.models.length === currentChain.models.length) {
+        return state;
+      }
+      return markConfigChanged(state, {
+        chains: state.chains.map(chain => chain.id === action.id ? synchronizedChain : chain),
+      });
+    }
     case 'ADD_LOG':
       return { ...state, logs: [action.log, ...state.logs].slice(0, 200) };
     case 'SET_LOG_SETTINGS':

@@ -20,6 +20,7 @@ import {
   Power,
   GripVertical,
   Trash2,
+  RefreshCw,
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { useStore } from '../store';
@@ -746,6 +747,10 @@ export default function FailoverChains() {
       <div className="space-y-4">
         {state.chains.map((chain, index) => {
           const isExpanded = expandedChain === chain.id;
+          const unselectedModelCount = chain.models.filter(model => {
+            const provider = state.providers.find(item => item.id === model.providerId);
+            return provider ? !provider.models.includes(model.modelName) : false;
+          }).length;
           return (
             <div key={chain.id} className={cn(
               'motion-card bg-white rounded-xl border overflow-hidden transition-all hover:-translate-y-0.5 hover:shadow-md',
@@ -933,6 +938,22 @@ export default function FailoverChains() {
                       </button>
                     </div>
                     <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => dispatch({ type: 'SYNC_CHAIN_MODELS', id: chain.id })}
+                        title={unselectedModelCount > 0
+                          ? `移除 ${unselectedModelCount} 个已在模型提供商中取消勾选的模型`
+                          : '当前链路模型已与模型提供商的勾选项同步'}
+                        className={cn(
+                          'flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border transition-colors',
+                          unselectedModelCount > 0
+                            ? 'border-cyan-200 text-cyan-600 hover:bg-cyan-50'
+                            : 'border-slate-200 text-slate-400 hover:bg-slate-50'
+                        )}
+                      >
+                        <RefreshCw size={13} />
+                        一键同步模型{unselectedModelCount > 0 ? ` (${unselectedModelCount})` : ''}
+                      </button>
                       <button
                         onClick={() => { setEditingChain(chain); setShowEditor(true); }}
                         className="flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors"

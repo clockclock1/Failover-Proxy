@@ -21,31 +21,33 @@ function PageContent() {
   const PageComponent = pageComponents[state.currentPage] || pageComponents.dashboard;
 
   return (
-    <div key={state.currentPage} className="page-motion relative">
+    <div key={state.currentPage} className="page-motion">
       <AsyncPageErrorBoundary pageKey={state.currentPage}>
-        <Suspense key={state.currentPage} fallback={<PageLoading />}>
-          <PageComponent key={state.currentPage} />
-        </Suspense>
+        {state.pageStatsLoading ? (
+          <PageLoading label="正在加载页面状态…" />
+        ) : (
+          <Suspense key={state.currentPage} fallback={<PageLoading label="正在加载页面内容…" />}>
+            <PageComponent key={state.currentPage} />
+          </Suspense>
+        )}
       </AsyncPageErrorBoundary>
-      {state.pageStatsLoading && (
-        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex min-h-24 items-center justify-center rounded-xl bg-slate-950/10 backdrop-blur-[1px]">
-          <div className="rounded-lg border border-slate-200 bg-white/95 px-4 py-3 shadow-sm">
-            <PageLoading label="正在加载状态…" compact />
-          </div>
-        </div>
-      )}
     </div>
   );
 }
 
-function PageLoading({ label = '正在加载页面…', compact = false }: { label?: string; compact?: boolean }) {
+function PageLoading({ label = '正在加载页面…' }: { label?: string }) {
   return (
-    <div className={`flex items-center justify-center text-sm text-slate-500 ${compact ? '' : 'min-h-72'}`}>
-      <div className={`flex items-center ${compact ? 'gap-2' : 'flex-col gap-5'}`}>
-        <LoadingSpinner size="md" className="text-cyan-400" />
-        <span className="font-medium">{label}</span>
+    <section className="page-loading-state" aria-live="polite" aria-busy="true">
+      <div className="page-loading-state__card">
+        <div className="page-loading-state__halo" aria-hidden="true">
+          <LoadingSpinner size="lg" className="page-loading-state__spinner" />
+        </div>
+        <div className="page-loading-state__copy">
+          <strong>{label}</strong>
+          <span>请稍候，正在同步最新数据</span>
+        </div>
       </div>
-    </div>
+    </section>
   );
 }
 
