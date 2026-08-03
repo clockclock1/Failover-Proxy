@@ -94,20 +94,6 @@ body {
   border-color: rgb(251 146 60 / 55%);
 }
 
-.app-bootstrap__spinner {
-  width: 24px;
-  height: 24px;
-  flex: 0 0 auto;
-  border: 3px solid rgb(125 211 252 / 35%);
-  border-top-color: #67e8f9;
-  border-radius: 50%;
-  animation: app-bootstrap-spin 750ms linear infinite;
-}
-
-@keyframes app-bootstrap-spin {
-  to { transform: rotate(360deg); }
-}
-
 .page-loading-state {
   display: flex;
   min-height: calc(100dvh - 8rem);
@@ -129,23 +115,6 @@ body {
     radial-gradient(circle at 14% 18%, rgba(34, 211, 238, 0.13), transparent 46%),
     rgba(9, 16, 34, 0.78);
   box-shadow: 0 22px 48px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
-
-.page-loading-state__halo {
-  display: flex;
-  width: 54px;
-  height: 54px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid rgba(34, 211, 238, 0.28);
-  border-radius: 16px;
-  color: #67e8f9;
-  background: rgba(8, 47, 73, 0.42);
-  box-shadow: inset 0 0 20px rgba(34, 211, 238, 0.1), 0 0 22px rgba(34, 211, 238, 0.08);
-}
-
-.page-loading-state__spinner {
-  color: currentColor !important;
 }
 
 .page-loading-state__copy {
@@ -176,12 +145,6 @@ body {
   box-shadow: 0 22px 48px rgba(15, 23, 42, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.8);
 }
 
-.uiverse-shell[data-theme="light"] .page-loading-state__halo {
-  border-color: rgba(14, 116, 144, 0.2);
-  color: #0891b2;
-  background: rgba(207, 250, 254, 0.72);
-  box-shadow: inset 0 0 20px rgba(6, 182, 212, 0.1), 0 0 22px rgba(6, 182, 212, 0.08);
-}
 
 svg {
   display: block;

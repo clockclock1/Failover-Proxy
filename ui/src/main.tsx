@@ -1,5 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { LoadingSpinner } from "./components/Loading";
 import "./index.css";
 
 const root = createRoot(document.getElementById("root")!);
@@ -9,7 +10,7 @@ function EntryLoading() {
   return (
     <main className="app-bootstrap" aria-live="polite" aria-busy="true">
       <div className="app-bootstrap__card">
-        <span className="app-bootstrap__spinner" aria-hidden="true" />
+        <LoadingSpinner size="md" className="text-cyan-400" />
         <div>
           <strong>Failover Proxy</strong>
           <p>正在加载管理界面…</p>

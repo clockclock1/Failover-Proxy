@@ -39,9 +39,7 @@ function PageLoading({ label = '正在加载页面…' }: { label?: string }) {
   return (
     <section className="page-loading-state" aria-live="polite" aria-busy="true">
       <div className="page-loading-state__card">
-        <div className="page-loading-state__halo" aria-hidden="true">
-          <LoadingSpinner size="lg" className="page-loading-state__spinner" />
-        </div>
+        <LoadingSpinner size="md" className="text-cyan-400" />
         <div className="page-loading-state__copy">
           <strong>{label}</strong>
           <span>请稍候，正在同步最新数据</span>

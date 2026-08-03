@@ -716,6 +716,7 @@ export default function FailoverChains() {
   const [showEditor, setShowEditor] = useState(false);
   const [editingChain, setEditingChain] = useState<FailoverChain | undefined>();
   const [expandedChain, setExpandedChain] = useState<string | null>(null);
+  const [syncResults, setSyncResults] = useState<Record<string, number>>({});
 
   const handleSave = (c: FailoverChain) => {
     if (editingChain) {
@@ -725,6 +726,11 @@ export default function FailoverChains() {
     }
     setShowEditor(false);
     setEditingChain(undefined);
+  };
+
+  const handleSyncModels = (chainId: string, removedCount: number) => {
+    dispatch({ type: 'SYNC_CHAIN_MODELS', id: chainId });
+    setSyncResults(current => ({ ...current, [chainId]: removedCount }));
   };
 
   return (
@@ -936,11 +942,21 @@ export default function FailoverChains() {
                       >
                         {chain.enabled ? '禁用' : '启用'}
                       </button>
+                      {Object.prototype.hasOwnProperty.call(syncResults, chain.id) && (
+                        <span className={cn(
+                          'text-xs',
+                          syncResults[chain.id] > 0 ? 'text-emerald-600' : 'text-slate-400'
+                        )} role="status">
+                          {syncResults[chain.id] > 0
+                            ? `已移除 ${syncResults[chain.id]} 个未选模型，待保存`
+                            : '当前模型已同步'}
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
-                        onClick={() => dispatch({ type: 'SYNC_CHAIN_MODELS', id: chain.id })}
+                        onClick={() => handleSyncModels(chain.id, unselectedModelCount)}
                         title={unselectedModelCount > 0
                           ? `移除 ${unselectedModelCount} 个已在模型提供商中取消勾选的模型`
                           : '当前链路模型已与模型提供商的勾选项同步'}
@@ -951,8 +967,10 @@ export default function FailoverChains() {
                             : 'border-slate-200 text-slate-400 hover:bg-slate-50'
                         )}
                       >
-                        <RefreshCw size={13} />
-                        一键同步模型{unselectedModelCount > 0 ? ` (${unselectedModelCount})` : ''}
+                        <span className="button-content-layer">
+                          <RefreshCw size={13} aria-hidden="true" />
+                          一键同步模型{unselectedModelCount > 0 ? ` (${unselectedModelCount})` : ''}
+                        </span>
                       </button>
                       <button
                         onClick={() => { setEditingChain(chain); setShowEditor(true); }}
