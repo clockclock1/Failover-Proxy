@@ -306,6 +306,7 @@ pub fn normalize_config(mut cfg: Config) -> Config {
     cfg.model_source = normalize_model_source(cfg.model_source);
     cfg.providers = normalize_providers(cfg.providers);
     cfg.models = cfg.models.into_iter().map(normalize_model).collect();
+    cfg.models = synchronize_model_targets_with_providers(cfg.models, &cfg.providers);
     cfg
 }
 
@@ -399,6 +400,37 @@ pub fn normalize_providers(providers: Vec<ProviderConfig>) -> Vec<ProviderConfig
             provider
         })
         .filter(|provider| !provider.base_url.is_empty())
+        .collect()
+}
+
+/// Removes targets whose matching provider no longer has the target model selected.
+/// Targets without a matching provider are retained for backward compatibility with
+/// configurations created before provider catalogs were introduced.
+pub fn synchronize_model_targets_with_providers(
+    models: Vec<ModelConfig>,
+    providers: &[ProviderConfig],
+) -> Vec<ModelConfig> {
+    models
+        .into_iter()
+        .map(|mut model| {
+            model.targets.retain(|target| {
+                let Some(provider) = providers.iter().find(|provider| {
+                    provider.name == target.name
+                        && provider.base_url == target.base_url
+                        && provider.api_key == target.api_key
+                        && provider.api_keys == target.api_keys
+                        && provider.api_key_mode == target.api_key_mode
+                }) else {
+                    return true;
+                };
+                provider
+                    .models
+                    .iter()
+                    .any(|name| name == &target.model_name)
+            });
+            model.targets = normalize_targets(model.targets);
+            model
+        })
         .collect()
 }
 
@@ -539,7 +571,7 @@ pub fn provider_name_from_url(url: &str) -> Option<String> {
 mod tests {
     use super::{
         endpoint_suffix, normalize_model, normalize_model_source, normalize_targets, target_label,
-        ApiKeyMode, Config, ModelConfig, ModelSourceConfig, TargetConfig,
+        ApiKeyMode, Config, ModelConfig, ModelSourceConfig, ProviderConfig, TargetConfig,
         DEFAULT_PROXY_CONTEXT_WINDOW_TOKENS,
     };
 
@@ -573,6 +605,58 @@ mod tests {
         assert_eq!(targets[0].api_key, "sk-a");
         assert_eq!(targets[0].api_keys, vec!["sk-a", "sk-b"]);
         assert_eq!(targets[0].api_key_mode, ApiKeyMode::RoundRobin);
+    }
+
+    #[test]
+    fn provider_catalog_prunes_only_unselected_matching_target_models() {
+        let provider = ProviderConfig {
+            id: "provider-1".to_string(),
+            name: "provider".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "sk-provider".to_string(),
+            api_keys: vec!["sk-provider".to_string()],
+            models: vec!["kept-model".to_string()],
+            ..ProviderConfig::default()
+        };
+        let provider_name = provider.name.clone();
+        let provider_base_url = provider.base_url.clone();
+        let provider_api_key = provider.api_key.clone();
+        let provider_api_keys = provider.api_keys.clone();
+        let matching_target = move |model_name: &str| TargetConfig {
+            name: provider_name.clone(),
+            base_url: provider_base_url.clone(),
+            api_key: provider_api_key.clone(),
+            api_keys: provider_api_keys.clone(),
+            model_name: model_name.to_string(),
+            ..TargetConfig::default()
+        };
+        let config = Config {
+            providers: vec![provider],
+            models: vec![ModelConfig {
+                targets: vec![
+                    matching_target("kept-model"),
+                    matching_target("removed-model"),
+                    TargetConfig {
+                        name: "legacy-provider".to_string(),
+                        base_url: "https://legacy.example.com/v1".to_string(),
+                        api_key: "sk-legacy".to_string(),
+                        model_name: "legacy-model".to_string(),
+                        ..TargetConfig::default()
+                    },
+                ],
+                ..ModelConfig::default()
+            }],
+            ..Config::default()
+        };
+
+        let normalized = super::normalize_config(config);
+        let target_models = normalized.models[0]
+            .targets
+            .iter()
+            .map(|target| target.model_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(target_models, vec!["kept-model", "legacy-model"]);
     }
 
     #[test]

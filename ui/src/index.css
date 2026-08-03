@@ -42,6 +42,72 @@ body {
   overflow-x: hidden;
 }
 
+.app-bootstrap {
+  display: flex;
+  min-height: 100dvh;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: #dbeafe;
+  background: radial-gradient(circle at top, #172554 0%, #08111f 52%, #030712 100%);
+}
+
+.app-bootstrap__card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: min(100%, 440px);
+  padding: 20px;
+  border: 1px solid rgb(59 130 246 / 45%);
+  border-radius: 14px;
+  background: rgb(15 23 42 / 88%);
+  box-shadow: 0 20px 55px rgb(2 6 23 / 50%);
+}
+
+.app-bootstrap__card strong {
+  color: #f8fafc;
+}
+
+.app-bootstrap__card p {
+  margin: 6px 0 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #bfdbfe;
+}
+
+.app-bootstrap__card button {
+  margin-top: 14px;
+  padding: 8px 13px;
+  border: 1px solid #38bdf8;
+  border-radius: 8px;
+  color: #ecfeff;
+  background: #0369a1;
+  cursor: pointer;
+}
+
+.app-bootstrap__card button:hover {
+  background: #0284c7;
+}
+
+.app-bootstrap__card--error {
+  align-items: flex-start;
+  border-color: rgb(251 146 60 / 55%);
+}
+
+.app-bootstrap__spinner {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  border: 3px solid rgb(125 211 252 / 35%);
+  border-top-color: #67e8f9;
+  border-radius: 50%;
+  animation: app-bootstrap-spin 750ms linear infinite;
+}
+
+@keyframes app-bootstrap-spin {
+  to { transform: rotate(360deg); }
+}
+
 svg {
   display: block;
   flex-shrink: 0;

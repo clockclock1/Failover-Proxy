@@ -81,7 +81,7 @@ function ChainEditor({
   const [circuitFailureThreshold, setCircuitFailureThreshold] = useState(chain?.circuitFailureThreshold || 3);
   const [circuitCooldownMinutes, setCircuitCooldownMinutes] = useState(chain?.circuitCooldownMinutes || 10);
   const [models, setModels] = useState<FailoverModel[]>(() => normalizeQueue(chain?.models || []));
-  const [activeSection, setActiveSection] = useState<'settings' | 'breaker' | 'models'>('settings');
+  const [activeSection, setActiveSection] = useState<'settings' | 'models'>('settings');
   const [modelQuery, setModelQuery] = useState('');
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
@@ -290,24 +290,6 @@ function ChainEditor({
             </button>
             <button
               type="button"
-              onClick={() => setActiveSection('breaker')}
-              className={cn(
-                'chain-editor-tab flex min-w-[180px] items-center gap-3 rounded-lg border px-3 py-3 text-left transition-all',
-                activeSection === 'breaker'
-                  ? 'border-amber-200 bg-white text-amber-700 shadow-sm'
-                  : 'border-transparent text-slate-500 hover:border-slate-200 hover:bg-white hover:text-slate-700'
-              )}
-            >
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-50 text-amber-600">
-                <ShieldAlert size={16} />
-              </span>
-              <span className="min-w-0">
-                <span className="block text-sm font-semibold">熔断策略</span>
-                  <span className="block truncate text-xs opacity-75">故障阈值和禁用时长</span>
-              </span>
-            </button>
-            <button
-              type="button"
               onClick={() => setActiveSection('models')}
               className={cn(
                 'chain-editor-tab flex min-w-[180px] items-center gap-3 rounded-lg border px-3 py-3 text-left transition-all',
@@ -436,7 +418,7 @@ function ChainEditor({
 
                   </>
                 )}
-                {activeSection === 'breaker' && (
+                {activeSection === 'settings' && (
                   <>
           <div className="rounded-lg border border-slate-200 bg-white p-4">
             <div className="flex items-start gap-3">

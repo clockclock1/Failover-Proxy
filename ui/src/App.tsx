@@ -4,6 +4,7 @@ import { StoreProvider, useStore } from './store';
 import Sidebar from './components/Sidebar';
 import Login from './components/Login';
 import LoadingOverlay, { LoadingSpinner } from './components/Loading';
+import AsyncPageErrorBoundary from './components/AsyncPageErrorBoundary';
 import { isKnownAppPath, pageComponents, pageFromPathname, pathForPage } from './pages';
 
 type ThemeMode = 'dark' | 'light';
@@ -20,21 +21,27 @@ function PageContent() {
   const PageComponent = pageComponents[state.currentPage] || pageComponents.dashboard;
 
   return (
-    <div key={state.currentPage} className="page-motion">
-      <Suspense key={state.currentPage} fallback={<PageLoading />}>
-        <div className={state.pageStatsLoading ? 'hidden' : undefined}>
+    <div key={state.currentPage} className="page-motion relative">
+      <AsyncPageErrorBoundary pageKey={state.currentPage}>
+        <Suspense key={state.currentPage} fallback={<PageLoading />}>
           <PageComponent key={state.currentPage} />
+        </Suspense>
+      </AsyncPageErrorBoundary>
+      {state.pageStatsLoading && (
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex min-h-24 items-center justify-center rounded-xl bg-slate-950/10 backdrop-blur-[1px]">
+          <div className="rounded-lg border border-slate-200 bg-white/95 px-4 py-3 shadow-sm">
+            <PageLoading label="正在加载状态…" compact />
+          </div>
         </div>
-        {state.pageStatsLoading && <PageLoading label="正在加载状态..." />}
-      </Suspense>
+      )}
     </div>
   );
 }
 
-function PageLoading({ label = '正在加载页面...' }: { label?: string }) {
+function PageLoading({ label = '正在加载页面…', compact = false }: { label?: string; compact?: boolean }) {
   return (
-    <div className="flex min-h-72 items-center justify-center text-sm text-slate-500">
-      <div className="flex flex-col items-center gap-5">
+    <div className={`flex items-center justify-center text-sm text-slate-500 ${compact ? '' : 'min-h-72'}`}>
+      <div className={`flex items-center ${compact ? 'gap-2' : 'flex-col gap-5'}`}>
         <LoadingSpinner size="md" className="text-cyan-400" />
         <span className="font-medium">{label}</span>
       </div>
