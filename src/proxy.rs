@@ -1255,6 +1255,11 @@ async fn call_target(
 }
 
 fn compact_request_context(body: &Value, requested: ProxyEndpoint) -> Option<Value> {
+    // Structured multimodal content cannot be safely reduced to text.  Keep the
+    // original request intact so a 422 retries/fails over without losing images.
+    if contains_image_input(body) {
+        return None;
+    }
     let before_tokens = estimate_json_tokens(body);
     let input_budget = (before_tokens.saturating_mul(2) / 3).max(256);
     let mut next = body.clone();
@@ -1272,6 +1277,19 @@ fn compact_request_context(body: &Value, requested: ProxyEndpoint) -> Option<Val
         ProxyEndpoint::Completions => compact_text_context(&mut next, "prompt", input_budget),
     };
     (changed && estimate_json_tokens(&next) < before_tokens).then_some(next)
+}
+
+fn contains_image_input(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_image_input),
+        Value::Object(fields) => {
+            matches!(
+                fields.get("type").and_then(Value::as_str),
+                Some("image_url" | "input_image")
+            ) || fields.values().any(contains_image_input)
+        }
+        _ => false,
+    }
 }
 
 fn compact_message_history(body: &mut Value, field: &str, input_budget: usize) -> bool {
@@ -1379,8 +1397,12 @@ fn requested_output_token_reserve(body: &Value) -> usize {
 // This intentionally overestimates instead of using a model-specific tokenizer:
 // target families may have different tokenizers, and a conservative local budget
 // is safer than sending a request that the fallback cannot accept.
+const IMAGE_INPUT_TOKEN_RESERVE: usize = 4_096;
+
 fn estimate_json_tokens(value: &Value) -> usize {
-    let text = serde_json::to_string(value).unwrap_or_default();
+    let mut image_inputs = 0usize;
+    let normalized = redact_image_payloads_for_estimation(value, &mut image_inputs);
+    let text = serde_json::to_string(&normalized).unwrap_or_default();
     let mut ascii_chars = 0usize;
     let mut non_ascii_chars = 0usize;
     for ch in text.chars() {
@@ -1390,7 +1412,43 @@ fn estimate_json_tokens(value: &Value) -> usize {
             non_ascii_chars += 1;
         }
     }
-    ascii_chars.div_ceil(3) + non_ascii_chars.saturating_mul(2)
+    ascii_chars
+        .div_ceil(3)
+        .saturating_add(non_ascii_chars.saturating_mul(2))
+        .saturating_add(image_inputs.saturating_mul(IMAGE_INPUT_TOKEN_RESERVE))
+}
+
+fn redact_image_payloads_for_estimation(value: &Value, image_inputs: &mut usize) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_image_payloads_for_estimation(item, image_inputs))
+                .collect(),
+        ),
+        Value::Object(fields) => {
+            let is_image_input = matches!(
+                fields.get("type").and_then(Value::as_str),
+                Some("image_url" | "input_image")
+            );
+            if is_image_input {
+                *image_inputs = image_inputs.saturating_add(1);
+            }
+            let mut redacted = serde_json::Map::new();
+            for (key, item) in fields {
+                if is_image_input && key == "image_url" {
+                    redacted.insert(key.clone(), Value::String("[image input]".to_string()));
+                } else {
+                    redacted.insert(
+                        key.clone(),
+                        redact_image_payloads_for_estimation(item, image_inputs),
+                    );
+                }
+            }
+            Value::Object(redacted)
+        }
+        _ => value.clone(),
+    }
 }
 
 fn is_endpoint_unsupported_status(status: reqwest::StatusCode) -> bool {
@@ -1804,31 +1862,88 @@ fn map_content_parts(content: Option<&Value>, to_chat: bool) -> Value {
         Some(Value::Array(parts)) => Value::Array(
             parts
                 .iter()
-                .map(|part| {
-                    let mut next = part.clone();
-                    if let Some(obj) = next.as_object_mut() {
-                        if let Some(kind) =
-                            obj.get("type").and_then(Value::as_str).map(str::to_string)
-                        {
-                            let mapped = match (to_chat, kind.as_str()) {
-                                (true, "input_text") | (true, "output_text") => Some("text"),
-                                (true, "input_image") => Some("image_url"),
-                                (false, "text") => Some("input_text"),
-                                (false, "image_url") => Some("input_image"),
-                                _ => None,
-                            };
-                            if let Some(mapped) = mapped {
-                                obj.insert("type".to_string(), Value::String(mapped.to_string()));
-                            }
-                        }
-                    }
-                    next
-                })
+                .map(|part| map_content_part(part, to_chat))
                 .collect(),
         ),
         Some(value) => value.clone(),
         None => Value::String(String::new()),
     }
+}
+
+fn map_content_part(part: &Value, to_chat: bool) -> Value {
+    let mut next = part.clone();
+    let Some(obj) = next.as_object_mut() else {
+        return next;
+    };
+    let Some(kind) = obj.get("type").and_then(Value::as_str).map(str::to_string) else {
+        return next;
+    };
+
+    match (to_chat, kind.as_str()) {
+        (true, "input_text") | (true, "output_text") => {
+            obj.insert("type".to_string(), Value::String("text".to_string()));
+        }
+        (false, "text") => {
+            obj.insert("type".to_string(), Value::String("input_text".to_string()));
+        }
+        // Responses stores the URL as a string and keeps `detail` next to it.
+        // Chat Completions instead nests both fields in `image_url`.
+        (true, "input_image") => {
+            let image_url = obj.get("image_url").cloned();
+            let detail = obj.remove("detail").or_else(|| {
+                image_url
+                    .as_ref()
+                    .and_then(|value| value.get("detail"))
+                    .cloned()
+            });
+            obj.insert("type".to_string(), Value::String("image_url".to_string()));
+            match image_url {
+                Some(Value::String(url)) => {
+                    let mut image = serde_json::Map::new();
+                    image.insert("url".to_string(), Value::String(url));
+                    if let Some(detail) = detail {
+                        image.insert("detail".to_string(), detail);
+                    }
+                    obj.insert("image_url".to_string(), Value::Object(image));
+                }
+                Some(Value::Object(mut image)) => {
+                    if !image.contains_key("detail") {
+                        if let Some(detail) = detail {
+                            image.insert("detail".to_string(), detail);
+                        }
+                    }
+                    obj.insert("image_url".to_string(), Value::Object(image));
+                }
+                Some(value) => {
+                    obj.insert("image_url".to_string(), value);
+                }
+                None => {}
+            }
+        }
+        (false, "image_url") => {
+            let image_url = obj.get("image_url").cloned();
+            let nested_detail = image_url
+                .as_ref()
+                .and_then(|value| value.get("detail"))
+                .cloned();
+            let url = image_url.as_ref().and_then(|value| match value {
+                Value::Object(image) => image.get("url").cloned(),
+                Value::String(url) => Some(Value::String(url.clone())),
+                _ => None,
+            });
+            obj.insert("type".to_string(), Value::String("input_image".to_string()));
+            if let Some(url) = url {
+                obj.insert("image_url".to_string(), url);
+            }
+            if obj.get("detail").is_none() {
+                if let Some(detail) = nested_detail {
+                    obj.insert("detail".to_string(), detail);
+                }
+            }
+        }
+        _ => {}
+    }
+    next
 }
 
 fn transform_response_text(
@@ -3251,6 +3366,36 @@ mod tests {
     }
 
     #[test]
+    fn chat_image_request_uses_responses_image_shape() {
+        let body = json!({
+            "model": "public-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,AAAA",
+                        "detail": "high"
+                    }}
+                ]
+            }]
+        });
+
+        let converted = build_upstream_body(
+            &body,
+            &target(),
+            ProxyEndpoint::ChatCompletions,
+            ProxyEndpoint::Responses,
+            false,
+        );
+        let image = &converted["input"][0]["content"][1];
+
+        assert_eq!(image["type"], "input_image");
+        assert_eq!(image["image_url"], "data:image/png;base64,AAAA");
+        assert_eq!(image["detail"], "high");
+    }
+
+    #[test]
     fn context_length_error_requires_422_and_context_marker() {
         assert!(is_context_length_error(
             422,
@@ -3371,6 +3516,37 @@ mod tests {
     }
 
     #[test]
+    fn context_422_never_compacts_multimodal_input() {
+        let body = json!({
+            "model": "public-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "A very long question"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]
+            }]
+        });
+
+        assert!(compact_request_context(&body, ProxyEndpoint::ChatCompletions).is_none());
+    }
+
+    #[test]
+    fn data_uri_image_is_not_estimated_as_text_context() {
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(100_000))}
+                }]
+            }]
+        });
+
+        assert!(estimate_json_tokens(&body) < 10_000);
+    }
+
+    #[test]
     fn context_422_compacts_responses_input_before_retrying() {
         let body = json!({
             "model": "public-model",
@@ -3409,6 +3585,33 @@ mod tests {
         assert_eq!(converted["messages"][1]["role"], "user");
         assert_eq!(converted["messages"][1]["content"], "ping");
         assert_eq!(converted["max_tokens"], 8);
+    }
+
+    #[test]
+    fn responses_image_request_uses_chat_image_shape() {
+        let body = json!({
+            "model": "public-model",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this image"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "low"}
+                ]
+            }]
+        });
+
+        let converted = build_upstream_body(
+            &body,
+            &target(),
+            ProxyEndpoint::Responses,
+            ProxyEndpoint::ChatCompletions,
+            false,
+        );
+        let image = &converted["messages"][0]["content"][1];
+
+        assert_eq!(image["type"], "image_url");
+        assert_eq!(image["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(image["image_url"]["detail"], "low");
     }
 
     #[test]
