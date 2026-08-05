@@ -845,7 +845,10 @@ async fn proxy_loop(
                 );
             }
 
-            if used_endpoint != requested_endpoint {
+            if used_endpoint != requested_endpoint
+                && (!supports_stream_translation(requested_endpoint, used_endpoint)
+                    || !is_event_stream_content_type(&response_type))
+            {
                 let text = upstream.text().await.unwrap_or_default();
                 if let Some(failure) = classify_upstream_failure(status.as_u16(), &text, true, true)
                 {
@@ -1076,6 +1079,8 @@ async fn proxy_loop(
                 target_started,
                 status,
                 response_type,
+                requested_endpoint,
+                used_endpoint,
                 inspected,
                 !failed_models.is_empty(),
                 _slot.into_stream_guard(),
@@ -1220,7 +1225,9 @@ async fn call_target(
         .select_target_api_key(model, target)
         .expect("enabled targets always have at least one API key");
     for (idx, endpoint) in candidates.into_iter().enumerate() {
-        let upstream_stream = is_stream && endpoint == requested_endpoint;
+        let upstream_stream = is_stream
+            && (endpoint == requested_endpoint
+                || supports_stream_translation(requested_endpoint, endpoint));
         let next_body =
             build_upstream_body(body, target, requested_endpoint, endpoint, upstream_stream);
         let mut req = state
@@ -1252,6 +1259,21 @@ async fn call_target(
         return Ok(CompatibleUpstream { response, endpoint });
     }
     unreachable!("endpoint candidate list is non-empty")
+}
+
+fn supports_stream_translation(requested: ProxyEndpoint, upstream: ProxyEndpoint) -> bool {
+    matches!(
+        (requested, upstream),
+        (ProxyEndpoint::ChatCompletions, ProxyEndpoint::Responses)
+            | (ProxyEndpoint::Responses, ProxyEndpoint::ChatCompletions)
+    )
+}
+
+fn is_event_stream_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 fn compact_request_context(body: &Value, requested: ProxyEndpoint) -> Option<Value> {
@@ -2390,6 +2412,323 @@ async fn inspect_initial_stream(
     })
 }
 
+struct StreamProtocolTransformer {
+    requested: ProxyEndpoint,
+    upstream: ProxyEndpoint,
+    pending: String,
+    response_id: Option<String>,
+    created: Option<u64>,
+    model: Option<String>,
+    response_started: bool,
+    output_item_started: bool,
+    chat_role_sent: bool,
+    text_emitted: bool,
+    finished: bool,
+}
+
+impl StreamProtocolTransformer {
+    fn new(requested: ProxyEndpoint, upstream: ProxyEndpoint) -> Self {
+        Self {
+            requested,
+            upstream,
+            pending: String::new(),
+            response_id: None,
+            created: None,
+            model: None,
+            response_started: false,
+            output_item_started: false,
+            chat_role_sent: false,
+            text_emitted: false,
+            finished: false,
+        }
+    }
+
+    fn transform_chunk(&mut self, chunk: &Bytes) -> Bytes {
+        if self.requested == self.upstream {
+            return chunk.clone();
+        }
+        self.pending.push_str(&String::from_utf8_lossy(chunk));
+        let mut transformed = String::new();
+        while let Some(event) = take_complete_sse_event(&mut self.pending) {
+            transformed.push_str(&self.transform_event(&event));
+        }
+        Bytes::from(transformed)
+    }
+
+    fn transform_event(&mut self, event: &str) -> String {
+        match (self.requested, self.upstream) {
+            (ProxyEndpoint::Responses, ProxyEndpoint::ChatCompletions) => {
+                self.chat_event_as_responses(event)
+            }
+            (ProxyEndpoint::ChatCompletions, ProxyEndpoint::Responses) => {
+                self.responses_event_as_chat(event)
+            }
+            _ => event.to_string(),
+        }
+    }
+
+    fn chat_event_as_responses(&mut self, event: &str) -> String {
+        if sse_event_is_done(event) {
+            return self.finish_as_responses();
+        }
+        let mut output = String::new();
+        for payload in parse_sse_data_payloads(event) {
+            let Some(payload) = parse_json_safe(&payload) else {
+                continue;
+            };
+            self.remember_chat_metadata(&payload);
+            output.push_str(&self.start_responses_message());
+            let content = payload
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !content.is_empty() {
+                self.text_emitted = true;
+                output.push_str(&sse_event(
+                    "response.output_text.delta",
+                    json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": content,
+                    }),
+                ));
+            }
+            if payload
+                .pointer("/choices/0/finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                output.push_str(&self.finish_as_responses());
+            }
+        }
+        output
+    }
+
+    fn responses_event_as_chat(&mut self, event: &str) -> String {
+        if sse_event_is_done(event) {
+            return self.finish_as_chat(None);
+        }
+        let mut output = String::new();
+        for payload in parse_sse_data_payloads(event) {
+            let Some(payload) = parse_json_safe(&payload) else {
+                continue;
+            };
+            self.remember_responses_metadata(&payload);
+            match payload.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta") => {
+                    let delta = payload.get("delta").and_then(Value::as_str).unwrap_or_default();
+                    if !delta.is_empty() {
+                        self.text_emitted = true;
+                        output.push_str(&self.chat_delta(delta));
+                    }
+                }
+                Some("response.output_text.done") if !self.text_emitted => {
+                    let text = payload.get("text").and_then(Value::as_str).unwrap_or_default();
+                    if !text.is_empty() {
+                        self.text_emitted = true;
+                        output.push_str(&self.chat_delta(text));
+                    }
+                }
+                Some("response.completed") => {
+                    let response = payload.get("response").unwrap_or(&payload);
+                    if !self.text_emitted {
+                        let text = response_text(ProxyEndpoint::Responses, response);
+                        if !text.is_empty() {
+                            self.text_emitted = true;
+                            output.push_str(&self.chat_delta(&text));
+                        }
+                    }
+                    output.push_str(&self.finish_as_chat(Some(response)));
+                }
+                _ => {}
+            }
+        }
+        output
+    }
+
+    fn remember_chat_metadata(&mut self, payload: &Value) {
+        if self.response_id.is_none() {
+            self.response_id = payload.get("id").and_then(Value::as_str).map(str::to_string);
+        }
+        if self.created.is_none() {
+            self.created = payload.get("created").and_then(Value::as_u64);
+        }
+        if self.model.is_none() {
+            self.model = payload.get("model").and_then(Value::as_str).map(str::to_string);
+        }
+    }
+
+    fn remember_responses_metadata(&mut self, payload: &Value) {
+        let response = payload.get("response").unwrap_or(payload);
+        if self.response_id.is_none() {
+            self.response_id = response.get("id").and_then(Value::as_str).map(str::to_string);
+        }
+        if self.created.is_none() {
+            self.created = response
+                .get("created_at")
+                .or_else(|| response.get("created"))
+                .and_then(Value::as_u64);
+        }
+        if self.model.is_none() {
+            self.model = response.get("model").and_then(Value::as_str).map(str::to_string);
+        }
+    }
+
+    fn stream_id(&self, prefix: &str) -> String {
+        self.response_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", prefix, now_ms()))
+    }
+
+    fn start_responses_message(&mut self) -> String {
+        if self.response_started {
+            return String::new();
+        }
+        self.response_started = true;
+        self.output_item_started = true;
+        let id = self.stream_id("resp");
+        let created = self.created.unwrap_or_else(|| now_ms() / 1000);
+        let model = self.model.clone().unwrap_or_default();
+        format!(
+            "{}{}",
+            sse_event(
+                "response.created",
+                json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": id,
+                        "object": "response",
+                        "created_at": created,
+                        "status": "in_progress",
+                        "model": model,
+                        "output": [],
+                    }
+                }),
+            ),
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": format!("msg_{}", id),
+                        "type": "message",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    }
+                }),
+            )
+        )
+    }
+
+    fn finish_as_responses(&mut self) -> String {
+        if self.finished {
+            return String::new();
+        }
+        self.finished = true;
+        let mut output = self.start_responses_message();
+        let id = self.stream_id("resp");
+        if self.output_item_started {
+            output.push_str(&sse_event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": format!("msg_{}", id),
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [],
+                    }
+                }),
+            ));
+        }
+        output.push_str(&sse_event(
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": id,
+                    "object": "response",
+                    "created_at": self.created.unwrap_or_else(|| now_ms() / 1000),
+                    "status": "completed",
+                    "model": self.model.clone().unwrap_or_default(),
+                    "output": [],
+                }
+            }),
+        ));
+        output.push_str("data: [DONE]\n\n");
+        output
+    }
+
+    fn chat_delta(&mut self, content: &str) -> String {
+        let mut delta = serde_json::Map::new();
+        if !self.chat_role_sent {
+            self.chat_role_sent = true;
+            delta.insert("role".to_string(), Value::String("assistant".to_string()));
+        }
+        delta.insert("content".to_string(), Value::String(content.to_string()));
+        sse_data(json!({
+            "id": self.stream_id("chatcmpl"),
+            "object": "chat.completion.chunk",
+            "created": self.created.unwrap_or_else(|| now_ms() / 1000),
+            "model": self.model.clone().unwrap_or_default(),
+            "choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}],
+        }))
+    }
+
+    fn finish_as_chat(&mut self, response: Option<&Value>) -> String {
+        if self.finished {
+            return String::new();
+        }
+        self.finished = true;
+        if let Some(response) = response {
+            self.remember_responses_metadata(response);
+        }
+        format!(
+            "{}data: [DONE]\n\n",
+            sse_data(json!({
+                "id": self.stream_id("chatcmpl"),
+                "object": "chat.completion.chunk",
+                "created": self.created.unwrap_or_else(|| now_ms() / 1000),
+                "model": self.model.clone().unwrap_or_default(),
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }))
+        )
+    }
+}
+
+fn take_complete_sse_event(pending: &mut String) -> Option<String> {
+    let lf = pending.find("\n\n");
+    let crlf = pending.find("\r\n\r\n");
+    let (index, separator_len) = match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf <= crlf => (lf, 2),
+        (Some(_), Some(crlf)) => (crlf, 4),
+        (Some(lf), None) => (lf, 2),
+        (None, Some(crlf)) => (crlf, 4),
+        (None, None) => return None,
+    };
+    Some(pending.drain(..index + separator_len).collect())
+}
+
+fn sse_event_is_done(event: &str) -> bool {
+    event.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("data:")
+            .is_some_and(|data| data.trim() == "[DONE]")
+    })
+}
+
+fn sse_event(name: &str, payload: Value) -> String {
+    format!("event: {name}\ndata: {payload}\n\n")
+}
+
+fn sse_data(payload: Value) -> String {
+    format!("data: {payload}\n\n")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     state: AppState,
@@ -2404,6 +2743,8 @@ fn stream_response(
     _target_started: u64,
     status: StatusCode,
     response_type: String,
+    requested_endpoint: ProxyEndpoint,
+    upstream_endpoint: ProxyEndpoint,
     mut inspected: StreamInspection,
     failover: bool,
     slot: StreamSlotGuard,
@@ -2412,6 +2753,7 @@ fn stream_response(
     let response_model_name = target.model_name.clone();
     let body_stream = async_stream::stream! {
         let slot_guard = slot;
+        let mut transformer = StreamProtocolTransformer::new(requested_endpoint, upstream_endpoint);
         let mut request_errors = failed_errors.clone();
         let mut completion = StreamCompletionDetector::default();
         let mut completed = false;
@@ -2443,7 +2785,10 @@ fn stream_response(
                 )
                 .await;
             }
-            yield Ok::<Bytes, Infallible>(chunk);
+            let transformed = transformer.transform_chunk(&chunk);
+            if !transformed.is_empty() {
+                yield Ok::<Bytes, Infallible>(transformed);
+            }
             if completed {
                 break;
             }
@@ -2469,7 +2814,10 @@ fn stream_response(
                                 )
                                 .await;
                             }
-                            yield Ok::<Bytes, Infallible>(chunk);
+                            let transformed = transformer.transform_chunk(&chunk);
+                            if !transformed.is_empty() {
+                                yield Ok::<Bytes, Infallible>(transformed);
+                            }
                             if completed {
                                 break;
                             }
@@ -2554,7 +2902,11 @@ fn stream_response(
     *response.status_mut() = status;
     insert_common_proxy_headers(
         response.headers_mut(),
-        &response_type,
+        if requested_endpoint == upstream_endpoint {
+            &response_type
+        } else {
+            "text/event-stream"
+        },
         &response_target_name,
         &response_model_name,
         true,
@@ -3711,6 +4063,51 @@ mod tests {
     }
 
     #[test]
+    fn chat_stream_is_translated_to_responses_incrementally() {
+        let mut transformer = StreamProtocolTransformer::new(
+            ProxyEndpoint::Responses,
+            ProxyEndpoint::ChatCompletions,
+        );
+
+        assert!(transformer
+            .transform_chunk(&Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl_1\",\"created\":123,\"model\":\"vision-model\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}"
+            ))
+            .is_empty());
+        let output = transformer.transform_chunk(&Bytes::from_static(
+            b"\n\ndata: {\"id\":\"chatcmpl_1\",\"created\":123,\"model\":\"vision-model\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ));
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(output.contains("event: response.created"));
+        assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("\"delta\":\"hello\""));
+        assert!(output.contains("event: response.completed"));
+        assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn responses_stream_is_translated_to_chat_incrementally() {
+        let mut transformer = StreamProtocolTransformer::new(
+            ProxyEndpoint::ChatCompletions,
+            ProxyEndpoint::Responses,
+        );
+        let output = transformer.transform_chunk(&Bytes::from_static(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        ));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("\"content\":\"hello\""));
+        assert!(!output.contains("[DONE]"));
+
+        let output = transformer.transform_chunk(&Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        ));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("\"finish_reason\":\"stop\""));
+        assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
     fn completions_response_can_be_returned_as_chat_response() {
         let upstream = json!({
             "id": "cmpl-1",
@@ -3927,6 +4324,8 @@ mod tests {
             now_ms(),
             StatusCode::OK,
             "text/event-stream".to_string(),
+            ProxyEndpoint::ChatCompletions,
+            ProxyEndpoint::ChatCompletions,
             inspected,
             false,
             slot.into_stream_guard(),
@@ -3943,6 +4342,58 @@ mod tests {
             Bytes::from_static(b"data: {\"delta\":\"hello\"}\n\ndata: [DONE]\n\n")
         );
         assert_eq!(state.stats.snapshot().await.successes, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_response_translates_chat_events_for_responses_clients() {
+        let state = test_state().await;
+        let model = model();
+        let target = target();
+        let slot = state.proxy_runtime.acquire(&model, "public-model").await;
+        let inspected = StreamInspection {
+            chunks: vec![
+                Bytes::from_static(
+                    b"data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+                ),
+                Bytes::from_static(
+                    b"data: {\"id\":\"chatcmpl_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                ),
+            ],
+            stream: None,
+            failure: None,
+        };
+
+        let response = stream_response(
+            state,
+            model,
+            target,
+            slot.thread_id.as_ref().expect("thread id").clone(),
+            "public-model".to_string(),
+            Vec::new(),
+            Vec::new(),
+            "upstream|real-model".to_string(),
+            now_ms(),
+            now_ms(),
+            StatusCode::OK,
+            "text/event-stream".to_string(),
+            ProxyEndpoint::Responses,
+            ProxyEndpoint::ChatCompletions,
+            inspected,
+            false,
+            slot.into_stream_guard(),
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("stream body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("\"delta\":\"hello\""));
+        assert!(body.contains("event: response.completed"));
+        assert!(body.contains("data: [DONE]"));
     }
 
     #[tokio::test]
@@ -3970,6 +4421,8 @@ mod tests {
             now_ms(),
             StatusCode::OK,
             "text/event-stream".to_string(),
+            ProxyEndpoint::ChatCompletions,
+            ProxyEndpoint::ChatCompletions,
             inspected,
             false,
             slot.into_stream_guard(),
