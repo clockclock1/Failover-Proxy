@@ -45,6 +45,9 @@ const DEFAULT_OUTPUT_TOKEN_RESERVE: usize = 1024;
 // The limit is only a loop-safety guard; compression stops earlier when it can no
 // longer reduce the request.
 const MAX_CONTEXT_COMPRESSION_ATTEMPTS: u32 = 32;
+const RESPONSE_HISTORY_TTL_MS: u64 = 12 * 60 * 60 * 1000;
+const MAX_RESPONSE_HISTORY_ENTRIES: usize = 256;
+const MAX_RESPONSE_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ProxyEndpoint {
@@ -132,7 +135,31 @@ impl ProxyCallError {
 pub struct ProxyRuntime {
     round_robin: Arc<DashMap<String, AtomicU64>>,
     active_threads: Arc<DashMap<String, ActiveThread>>,
+    response_history: Arc<DashMap<String, ResponseHistoryEntry>>,
     thread_seq: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct ResponseHistoryEntry {
+    parent_id: Option<String>,
+    input: Vec<Value>,
+    output: Vec<Value>,
+    instructions: Option<String>,
+    updated_at: u64,
+    expires_at: u64,
+    estimated_bytes: usize,
+}
+
+#[derive(Clone)]
+struct ResponseHistoryRequest {
+    parent_id: Option<String>,
+    input: Vec<Value>,
+    instructions: Option<String>,
+}
+
+struct ExpandedResponseHistory {
+    input: Vec<Value>,
+    instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -308,6 +335,135 @@ impl ProxyRuntime {
         usage
     }
 
+    pub fn response_history_memory_usage(&self) -> RuntimeMemoryUsage {
+        let mut usage = dashmap_memory_overhead(&self.response_history);
+        for entry in self.response_history.iter() {
+            let record = entry.value();
+            usage.entries += 1;
+            usage.content_bytes += entry.key().capacity()
+                + record.parent_id.as_ref().map(String::capacity).unwrap_or(0)
+                + record
+                    .instructions
+                    .as_ref()
+                    .map(String::capacity)
+                    .unwrap_or(0)
+                + record.estimated_bytes;
+        }
+        usage.finish();
+        usage
+    }
+
+    fn expand_response_history(&self, response_id: &str) -> Option<ExpandedResponseHistory> {
+        let now = now_ms();
+        let mut cursor = response_id.to_string();
+        let mut seen = HashSet::new();
+        let mut chain = Vec::new();
+        while seen.insert(cursor.clone()) && chain.len() < 128 {
+            let entry = {
+                let mut entry = self.response_history.get_mut(&cursor)?;
+                if entry.expires_at <= now {
+                    drop(entry);
+                    self.response_history.remove(&cursor);
+                    return None;
+                }
+                entry.updated_at = now;
+                entry.expires_at = now.saturating_add(RESPONSE_HISTORY_TTL_MS);
+                entry.clone()
+            };
+            let parent_id = entry.parent_id.clone();
+            chain.push(entry);
+            let Some(parent_id) = parent_id else {
+                break;
+            };
+            cursor = parent_id;
+        }
+        if chain.is_empty() || chain.len() >= 128 {
+            return None;
+        }
+        chain.reverse();
+        let mut input = Vec::new();
+        let mut instructions = None;
+        for entry in chain {
+            input.extend(entry.input);
+            input.extend(entry.output);
+            if instructions.is_none() {
+                instructions = entry.instructions;
+            }
+        }
+        Some(ExpandedResponseHistory {
+            input,
+            instructions,
+        })
+    }
+
+    fn store_response_history(&self, request: &ResponseHistoryRequest, response: &Value) {
+        let Some(response_id) = response.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(output) = response.get("output").and_then(Value::as_array) else {
+            return;
+        };
+        let estimated_bytes = serde_json::to_vec(&json!({
+            "input": request.input,
+            "output": output,
+        }))
+        .map(|value| value.len())
+        .unwrap_or_default();
+        if estimated_bytes > MAX_RESPONSE_HISTORY_BYTES {
+            tracing::warn!(
+                response_id,
+                estimated_bytes,
+                "response history entry exceeds local cache limit"
+            );
+            return;
+        }
+        let now = now_ms();
+        self.response_history.insert(
+            response_id.to_string(),
+            ResponseHistoryEntry {
+                parent_id: request.parent_id.clone(),
+                input: request.input.clone(),
+                output: output.clone(),
+                instructions: request.instructions.clone(),
+                updated_at: now,
+                expires_at: now.saturating_add(RESPONSE_HISTORY_TTL_MS),
+                estimated_bytes,
+            },
+        );
+        self.cleanup_response_history();
+    }
+
+    pub fn cleanup_response_history(&self) {
+        let now = now_ms();
+        let mut entries = self
+            .response_history
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().updated_at,
+                    entry.value().expires_at,
+                    entry.value().estimated_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (id, _, expires_at, _) in &entries {
+            if *expires_at <= now {
+                self.response_history.remove(id);
+            }
+        }
+        entries.retain(|(_, _, expires_at, _)| *expires_at > now);
+        entries.sort_by_key(|(_, updated_at, _, _)| *updated_at);
+        let mut total_bytes = entries.iter().map(|(_, _, _, bytes)| *bytes).sum::<usize>();
+        while entries.len() > MAX_RESPONSE_HISTORY_ENTRIES
+            || total_bytes > MAX_RESPONSE_HISTORY_BYTES
+        {
+            let (id, _, _, bytes) = entries.remove(0);
+            total_bytes = total_bytes.saturating_sub(bytes);
+            self.response_history.remove(&id);
+        }
+    }
+
     pub fn retain_round_robin_models(&self, models: &[ModelConfig]) {
         let valid = models
             .iter()
@@ -402,6 +558,69 @@ pub async fn proxy_endpoint(
     proxy_completion(state, headers, uri.path().to_string(), body).await
 }
 
+fn response_input_items(input: Option<&Value>) -> Vec<Value> {
+    match input {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(text)) => vec![json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })],
+        Some(value) if !value.is_null() => vec![value.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn prepare_response_history_request(
+    runtime: &ProxyRuntime,
+    body: &mut Value,
+    requested_endpoint: ProxyEndpoint,
+) -> Option<ResponseHistoryRequest> {
+    if requested_endpoint != ProxyEndpoint::Responses {
+        return None;
+    }
+    let input = response_input_items(body.get("input"));
+    let instructions = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let previous_response_id = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(previous_response_id) = previous_response_id else {
+        return Some(ResponseHistoryRequest {
+            parent_id: None,
+            input,
+            instructions,
+        });
+    };
+    let Some(history) = runtime.expand_response_history(&previous_response_id) else {
+        // This ID was not issued by this process. Preserve it for a native
+        // Responses upstream instead of pretending the conversation is known.
+        return None;
+    };
+    let mut expanded_input = history.input;
+    expanded_input.extend(input.clone());
+    let Some(object) = body.as_object_mut() else {
+        return None;
+    };
+    object.insert("input".to_string(), Value::Array(expanded_input));
+    object.remove("previous_response_id");
+    if instructions.is_none() {
+        if let Some(previous_instructions) = history.instructions {
+            object.insert(
+                "instructions".to_string(),
+                Value::String(previous_instructions),
+            );
+        }
+    }
+    Some(ResponseHistoryRequest {
+        parent_id: Some(previous_response_id),
+        input,
+        instructions,
+    })
+}
+
 async fn proxy_completion(
     state: AppState,
     headers: HeaderMap,
@@ -431,6 +650,9 @@ async fn proxy_completion(
             None,
         );
     };
+    let requested_endpoint = ProxyEndpoint::from_path(&pathname);
+    let response_history_request =
+        prepare_response_history_request(&state.proxy_runtime, &mut body, requested_endpoint);
     let requested_context_tokens =
         estimate_json_tokens(&body).saturating_add(requested_output_token_reserve(&body));
     let proxy_context_window = model.context_window_tokens.max(1024);
@@ -464,6 +686,7 @@ async fn proxy_completion(
         targets,
         &requested_model,
         &thread_id,
+        response_history_request,
         slot,
     )
     .await;
@@ -480,6 +703,7 @@ async fn proxy_loop(
     targets: Vec<TargetConfig>,
     requested_model: &str,
     thread_id: &str,
+    response_history_request: Option<ResponseHistoryRequest>,
     _slot: ProxySlot,
 ) -> Response {
     state.stats.chain_request(&model.public_name).await;
@@ -872,6 +1096,15 @@ async fn proxy_loop(
                     &target,
                 )
                 .unwrap_or(text);
+                if requested_endpoint == ProxyEndpoint::Responses {
+                    if let (Some(history_request), Some(response_payload)) =
+                        (response_history_request.as_ref(), parse_json_safe(&text))
+                    {
+                        state
+                            .proxy_runtime
+                            .store_response_history(history_request, &response_payload);
+                    }
+                }
                 return raw_response(
                     status,
                     response_type,
@@ -970,6 +1203,24 @@ async fn proxy_loop(
                         .join(", "),
                 )
                 .await;
+                if requested_endpoint == ProxyEndpoint::Responses {
+                    let response_text = transform_response_text(
+                        requested_endpoint,
+                        used_endpoint,
+                        &text,
+                        requested_model,
+                        &target,
+                    )
+                    .unwrap_or_else(|| text.clone());
+                    if let (Some(history_request), Some(response_payload)) = (
+                        response_history_request.as_ref(),
+                        parse_json_safe(&response_text),
+                    ) {
+                        state
+                            .proxy_runtime
+                            .store_response_history(history_request, &response_payload);
+                    }
+                }
                 return synthetic_stream_response(
                     requested_endpoint,
                     used_endpoint,
@@ -1118,6 +1369,7 @@ async fn proxy_loop(
                 used_endpoint,
                 inspected,
                 !failed_models.is_empty(),
+                response_history_request.clone(),
                 _slot.into_stream_guard(),
             );
         }
@@ -2529,6 +2781,7 @@ struct StreamProtocolTransformer {
     text: String,
     reasoning_text: String,
     function_calls: Vec<StreamFunctionCall>,
+    completed_responses_payload: Option<Value>,
     finished: bool,
 }
 
@@ -2558,12 +2811,20 @@ impl StreamProtocolTransformer {
             text: String::new(),
             reasoning_text: String::new(),
             function_calls: Vec::new(),
+            completed_responses_payload: None,
             finished: false,
         }
     }
 
     fn transform_chunk(&mut self, chunk: &Bytes) -> Bytes {
         if self.requested == self.upstream {
+            // Keep native Responses streams byte-for-byte intact, but still retain the
+            // completed response locally.  This lets a later turn move from a native
+            // Responses target to a Chat Completions-only failover target without
+            // losing `previous_response_id` context.
+            if self.requested == ProxyEndpoint::Responses {
+                self.capture_native_responses_completion(chunk);
+            }
             return chunk.clone();
         }
         self.pending.push_str(&String::from_utf8_lossy(chunk));
@@ -2572,6 +2833,29 @@ impl StreamProtocolTransformer {
             transformed.push_str(&self.transform_event(&event));
         }
         Bytes::from(transformed)
+    }
+
+    fn take_completed_responses_payload(&mut self) -> Option<Value> {
+        self.completed_responses_payload.take()
+    }
+
+    fn capture_native_responses_completion(&mut self, chunk: &Bytes) {
+        self.pending.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(event) = take_complete_sse_event(&mut self.pending) {
+            for payload in parse_sse_data_payloads(&event) {
+                let Some(payload) = parse_json_safe(&payload) else {
+                    continue;
+                };
+                if payload.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    if let Some(response) = payload
+                        .get("response")
+                        .filter(|response| response.is_object())
+                    {
+                        self.completed_responses_payload = Some(response.clone());
+                    }
+                }
+            }
+        }
     }
 
     fn transform_event(&mut self, event: &str) -> String {
@@ -3070,18 +3354,20 @@ impl StreamProtocolTransformer {
             }
         }
         final_output.sort_by_key(|(index, _)| *index);
+        let completed_response = json!({
+            "id": id,
+            "object": "response",
+            "created_at": self.created.unwrap_or_else(|| now_ms() / 1000),
+            "status": "completed",
+            "model": self.model.clone().unwrap_or_default(),
+            "output": final_output.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
+        });
+        self.completed_responses_payload = Some(completed_response.clone());
         output.push_str(&sse_event(
             "response.completed",
             json!({
                 "type": "response.completed",
-                "response": {
-                    "id": id,
-                    "object": "response",
-                    "created_at": self.created.unwrap_or_else(|| now_ms() / 1000),
-                    "status": "completed",
-                    "model": self.model.clone().unwrap_or_default(),
-                    "output": final_output.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
-                }
+                "response": completed_response,
             }),
         ));
         output.push_str("data: [DONE]\n\n");
@@ -3172,6 +3458,7 @@ fn stream_response(
     upstream_endpoint: ProxyEndpoint,
     mut inspected: StreamInspection,
     failover: bool,
+    response_history_request: Option<ResponseHistoryRequest>,
     slot: StreamSlotGuard,
 ) -> Response {
     let response_target_name = target.name.clone();
@@ -3211,6 +3498,14 @@ fn stream_response(
                 .await;
             }
             let transformed = transformer.transform_chunk(&chunk);
+            if let (Some(history_request), Some(response_payload)) = (
+                response_history_request.as_ref(),
+                transformer.take_completed_responses_payload(),
+            ) {
+                state
+                    .proxy_runtime
+                    .store_response_history(history_request, &response_payload);
+            }
             if !transformed.is_empty() {
                 yield Ok::<Bytes, Infallible>(transformed);
             }
@@ -3240,6 +3535,14 @@ fn stream_response(
                                 .await;
                             }
                             let transformed = transformer.transform_chunk(&chunk);
+                            if let (Some(history_request), Some(response_payload)) = (
+                                response_history_request.as_ref(),
+                                transformer.take_completed_responses_payload(),
+                            ) {
+                                state
+                                    .proxy_runtime
+                                    .store_response_history(history_request, &response_payload);
+                            }
                             if !transformed.is_empty() {
                                 yield Ok::<Bytes, Infallible>(transformed);
                             }
@@ -4200,6 +4503,59 @@ mod tests {
     }
 
     #[test]
+    fn cached_responses_history_is_expanded_for_a_chat_only_upstream() {
+        let runtime = ProxyRuntime::default();
+        let mut first = json!({
+            "model": "public-model",
+            "instructions": "Use tools when needed.",
+            "input": "list files"
+        });
+        let first_request =
+            prepare_response_history_request(&runtime, &mut first, ProxyEndpoint::Responses)
+                .expect("initial response request is cacheable");
+        runtime.store_response_history(
+            &first_request,
+            &json!({
+                "id": "resp_local_1",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"dir\"}"
+                }]
+            }),
+        );
+
+        let mut second = json!({
+            "model": "public-model",
+            "previous_response_id": "resp_local_1",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "Cargo.toml"
+            }]
+        });
+        let second_request =
+            prepare_response_history_request(&runtime, &mut second, ProxyEndpoint::Responses)
+                .expect("cached response id must be expanded locally");
+
+        assert_eq!(second_request.parent_id.as_deref(), Some("resp_local_1"));
+        assert!(second.get("previous_response_id").is_none());
+        assert_eq!(second["instructions"], "Use tools when needed.");
+        assert_eq!(second["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(second["input"][1]["type"], "function_call");
+        assert_eq!(second["input"][2]["type"], "function_call_output");
+        assert_eq!(
+            endpoint_candidates_for_request(ProxyEndpoint::Responses, &second),
+            vec![
+                ProxyEndpoint::ChatCompletions,
+                ProxyEndpoint::Responses,
+                ProxyEndpoint::Completions,
+            ]
+        );
+    }
+
+    #[test]
     fn chat_image_request_uses_responses_image_shape() {
         let body = json!({
             "model": "public-model",
@@ -4942,6 +5298,7 @@ mod tests {
             ProxyEndpoint::ChatCompletions,
             inspected,
             false,
+            None,
             slot.into_stream_guard(),
         );
 
@@ -4978,7 +5335,7 @@ mod tests {
         };
 
         let response = stream_response(
-            state,
+            state.clone(),
             model,
             target,
             slot.thread_id.as_ref().expect("thread id").clone(),
@@ -4994,6 +5351,14 @@ mod tests {
             ProxyEndpoint::ChatCompletions,
             inspected,
             false,
+            Some(ResponseHistoryRequest {
+                parent_id: None,
+                input: vec![json!({
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                })],
+                instructions: None,
+            }),
             slot.into_stream_guard(),
         );
 
@@ -5008,6 +5373,72 @@ mod tests {
         assert!(body.contains("\"delta\":\"hello\""));
         assert!(body.contains("event: response.completed"));
         assert!(body.contains("data: [DONE]"));
+        let history = state
+            .proxy_runtime
+            .expand_response_history("chatcmpl_1")
+            .expect("completed converted stream should be retained for the next turn");
+        assert_eq!(history.input.len(), 2);
+        assert_eq!(
+            history.input[1]
+                .pointer("/content/0/text")
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_responses_stream_completion_is_retained_without_rewriting_the_stream() {
+        let state = test_state().await;
+        let model = model();
+        let target = target();
+        let slot = state.proxy_runtime.acquire(&model, "public-model").await;
+        let event = Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_native_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}]}}\n\n",
+        );
+        let response = stream_response(
+            state.clone(),
+            model,
+            target,
+            slot.thread_id.as_ref().expect("thread id").clone(),
+            "public-model".to_string(),
+            Vec::new(),
+            Vec::new(),
+            "upstream|real-model".to_string(),
+            now_ms(),
+            now_ms(),
+            StatusCode::OK,
+            "text/event-stream".to_string(),
+            ProxyEndpoint::Responses,
+            ProxyEndpoint::Responses,
+            StreamInspection {
+                chunks: vec![event.clone()],
+                stream: None,
+                failure: None,
+            },
+            false,
+            Some(ResponseHistoryRequest {
+                parent_id: None,
+                input: vec![json!({
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                })],
+                instructions: None,
+            }),
+            slot.into_stream_guard(),
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("stream body")
+            .to_bytes();
+        assert_eq!(body, event);
+        let history = state
+            .proxy_runtime
+            .expand_response_history("resp_native_1")
+            .expect("native completed stream should be retained for failover");
+        assert_eq!(history.input.len(), 2);
     }
 
     #[tokio::test]
@@ -5039,6 +5470,7 @@ mod tests {
             ProxyEndpoint::ChatCompletions,
             inspected,
             false,
+            None,
             slot.into_stream_guard(),
         );
         let mut body = response.into_body();

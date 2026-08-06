@@ -679,11 +679,11 @@ pub fn spawn_runtime_state_cleanup(state: AppState) {
             interval.tick().await;
             if !restored_breakers {
                 let stats = state.stats.snapshot().await;
-                state.circuit_breakers.restore_open_breakers(
-                    stats.targets.into_iter().map(|(key, target)| {
+                state
+                    .circuit_breakers
+                    .restore_open_breakers(stats.targets.into_iter().map(|(key, target)| {
                         (key, target.consecutive_failures, target.disabled_until)
-                    }),
-                );
+                    }));
                 restored_breakers = true;
             }
             let cfg = state.config.read().await.clone();
@@ -696,12 +696,14 @@ pub fn spawn_runtime_state_cleanup(state: AppState) {
 pub async fn cleanup_runtime_state(state: &AppState, models: &[ModelConfig]) {
     state.circuit_breakers.cleanup_expired();
     state.proxy_runtime.retain_round_robin_models(models);
+    state.proxy_runtime.cleanup_response_history();
     state.stats.cleanup_runtime_models(models).await;
 }
 
 async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
     let circuit_breakers = state.circuit_breakers.memory_usage();
     let round_robin = state.proxy_runtime.round_robin_memory_usage();
+    let response_history = state.proxy_runtime.response_history_memory_usage();
     let model_statistics = state.stats.model_statistics_memory_usage().await;
     let provider_health_cache = state.provider_health.memory_usage().await;
     let model_source_cache = state.model_source.memory_usage().await;
@@ -711,6 +713,7 @@ async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
     let accounted_table_bytes = [
         circuit_breakers.estimated_bytes,
         round_robin.estimated_bytes,
+        response_history.estimated_bytes,
         model_statistics.estimated_bytes,
         provider_health_cache.estimated_bytes,
         model_source_cache.estimated_bytes,
@@ -728,11 +731,17 @@ async fn runtime_state_memory(state: &AppState, process: &Value) -> Value {
         ("rssBytes", "驻留内存"),
     ]
     .into_iter()
-    .find_map(|(key, label)| process.get(key)?.as_u64().map(|value| (value as usize, label)))
+    .find_map(|(key, label)| {
+        process
+            .get(key)?
+            .as_u64()
+            .map(|value| (value as usize, label))
+    })
     .unwrap_or((0, "进程内存"));
     json!({
         "circuitBreakers": circuit_breakers,
         "roundRobin": round_robin,
+        "responseHistory": response_history,
         "modelStatistics": model_statistics,
         "providerHealthCache": provider_health_cache,
         "modelSourceCache": model_source_cache,
