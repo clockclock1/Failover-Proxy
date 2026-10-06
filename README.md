@@ -13,7 +13,7 @@ Failover Proxy 是一个 OpenAI 兼容的大模型故障转移代理，内置可
 - Admin Token 登录与 Session 管理，支持 `/api/login`、`/api/logout`、`/api/session`。
 - 多模型故障转移链，每个公开模型可配置有序 targets。
 - Chat Completions 与 Responses 双向适配：自动按目标端点探测并转换请求、普通响应和 SSE 流；覆盖工具调用历史、文本格式、推理片段、结束原因、用量和常见图像/音频/文件/视频内容。`previous_response_id` 等有状态字段仅在本机已有对应响应历史时展开后转换，否则保留到原生 Responses 上游。
-- 可选启用双向兼容路由：`chatCompletionsToResponsesPolicy` 可将 Chat 请求优先转发为 Responses；`responsesToChatCompletionsPolicy` 可将 Responses 请求优先降级为 Chat。两项策略均可按上游目标名和请求模型正则筛选；默认关闭，`passThroughRequestEnabled` 为 true 时不执行策略转换。未命中策略时优先请求原生端点，仅在上游明确不支持该端点时自动回退。
+- Chat Completions 与 Responses 自动双向路由：普通请求和 Chat 函数工具请求优先走对应原生端点，端点不受支持时自动尝试另一协议；Responses 函数工具请求自动优先尝试 Chat Completions，以兼容只在 Chat 接口实现工具调用的上游。Responses 有状态字段及 Chat 多候选等无法安全转换的请求保留原生路由，无需单独配置。
 - 支持上游字段：`name`、`baseUrl`、`apiKey`、`modelName`、`enabled`、`priority`、`weight`、`maxRetries`、`timeoutMs` 等。
 - 故障转移策略：`priority`、`round-robin`、`weighted`、`latency-based`。
 - 模型源模式：从自定义 `/v1/models` URL 拉取模型，支持 include/exclude 过滤、publicPrefix/publicSuffix 和 `{model}` 模板。
@@ -273,7 +273,7 @@ Failover Proxy is an OpenAI-compatible LLM failover proxy with a visual manageme
   - `POST /v1/responses`, `POST /responses`, `POST /v1/response`, and `POST /response`
   - `POST /v1/completions` and `POST /completions`
 - Bidirectional Chat Completions / Responses adaptation: endpoint detection converts requests, non-streaming responses, and SSE streams, including tool history, text formats, reasoning, finish reasons, usage, and common image/audio/file/video content. Stateful fields such as `previous_response_id` are expanded only when this process has the matching response history; otherwise the request stays on a native Responses endpoint.
-- Optional bidirectional compatibility routing: `chatCompletionsToResponsesPolicy` prefers Responses for matching Chat requests, while `responsesToChatCompletionsPolicy` downgrades matching Responses requests to Chat. Both policies can match target names and request-model regexes. They are disabled by default, and `passThroughRequestEnabled: true` suppresses policy conversion. Requests outside a policy use the native endpoint first and fall back only when the upstream clearly does not support it.
+- Automatic bidirectional Chat Completions / Responses routing: ordinary requests and Chat function-tool requests use their native endpoint first and try the other protocol when unsupported. Responses function-tool requests automatically prefer Chat Completions to support upstreams that implement tool calling only on the Chat endpoint. Stateful Responses fields and Chat multi-choice requests that cannot be safely converted stay on their native route; no separate setting is required.
 - Custom proxy API keys via `Authorization: Bearer ...`.
 - Admin token login and session management with `/api/login`, `/api/logout`, and `/api/session`.
 - Multiple model failover chains. Each public model can define ordered upstream targets.

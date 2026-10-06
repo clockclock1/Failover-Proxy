@@ -91,43 +91,33 @@ fn endpoint_candidates_for_request(requested: ProxyEndpoint, body: &Value) -> Ve
     if requested == ProxyEndpoint::ChatCompletions && chat_request_requires_native_upstream(body) {
         return vec![ProxyEndpoint::ChatCompletions];
     }
-    requested.candidates().to_vec()
-}
-
-fn endpoint_candidates_for_target(
-    requested: ProxyEndpoint,
-    body: &Value,
-    target: &TargetConfig,
-    cfg: &Config,
-) -> Vec<ProxyEndpoint> {
-    if !cfg.pass_through_request_enabled {
-        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-        if requested == ProxyEndpoint::ChatCompletions
-            && cfg
-                .chat_completions_to_responses_policy
-                .is_enabled_for(target, model)
-            && !chat_request_requires_native_upstream(body)
+    let mut candidates = requested.candidates().to_vec();
+    if requested == ProxyEndpoint::Responses && request_has_function_tools(body) {
+        let compatible_endpoint = ProxyEndpoint::ChatCompletions;
+        if let Some(index) = candidates
+            .iter()
+            .position(|endpoint| *endpoint == compatible_endpoint)
         {
-            return vec![
-                ProxyEndpoint::Responses,
-                ProxyEndpoint::ChatCompletions,
-                ProxyEndpoint::Completions,
-            ];
-        }
-        if requested == ProxyEndpoint::Responses
-            && cfg
-                .responses_to_chat_completions_policy
-                .is_enabled_for(target, model)
-            && !responses_request_requires_native_upstream(body)
-        {
-            return vec![
-                ProxyEndpoint::ChatCompletions,
-                ProxyEndpoint::Responses,
-                ProxyEndpoint::Completions,
-            ];
+            let compatible_endpoint = candidates.remove(index);
+            candidates.insert(0, compatible_endpoint);
         }
     }
-    endpoint_candidates_for_request(requested, body)
+    candidates
+}
+
+fn request_has_function_tools(body: &Value) -> bool {
+    if body.get("tool_choice").is_some_and(|choice| {
+        choice == "none" || choice.get("type").and_then(Value::as_str) == Some("none")
+    }) {
+        return false;
+    }
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        })
 }
 
 fn chat_request_requires_native_upstream(body: &Value) -> bool {
@@ -146,40 +136,6 @@ fn chat_request_requires_native_upstream(body: &Value) -> bool {
                     .iter()
                     .any(|message| message.get("function_call").is_some())
             })
-}
-
-impl crate::config::ChatCompletionsToResponsesPolicy {
-    fn is_enabled_for(&self, target: &TargetConfig, model: &str) -> bool {
-        if !self.enabled || model.is_empty() {
-            return false;
-        }
-        let target_enabled =
-            self.all_targets || self.target_names.iter().any(|name| name == &target.name);
-        target_enabled
-            && !self.model_patterns.is_empty()
-            && self.model_patterns.iter().any(|pattern| {
-                !pattern.is_empty()
-                    && regex::Regex::new(pattern).is_ok_and(|compiled| compiled.is_match(model))
-            })
-    }
-}
-
-impl crate::config::ResponsesToChatCompletionsPolicy {
-    fn is_enabled_for(&self, target: &TargetConfig, model: &str) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let target_enabled =
-            self.all_targets || self.target_names.iter().any(|name| name == &target.name);
-        target_enabled
-            && (self.model_patterns.is_empty()
-                || (!model.is_empty()
-                    && self.model_patterns.iter().any(|pattern| {
-                        !pattern.is_empty()
-                            && regex::Regex::new(pattern)
-                                .is_ok_and(|compiled| compiled.is_match(model))
-                    })))
-    }
 }
 
 fn responses_request_requires_native_upstream(body: &Value) -> bool {
@@ -1603,7 +1559,7 @@ async fn call_target(
     requested_endpoint: ProxyEndpoint,
 ) -> Result<CompatibleUpstream, ProxyCallError> {
     let timeout = target_timeout(target, cfg);
-    let candidates = endpoint_candidates_for_target(requested_endpoint, body, target, cfg);
+    let candidates = endpoint_candidates_for_request(requested_endpoint, body);
     let api_key = state
         .proxy_runtime
         .select_target_api_key(model, target)
@@ -5834,11 +5790,12 @@ fn stream_probe_complete(text: &str) -> bool {
         .any(|payload| {
             stream_payload_has_meaningful_output(&payload)
                 || stream_payload_is_responses_lifecycle_event(&payload)
-        }) || text.lines().any(|line| {
-        line.strip_prefix("event:")
-            .map(str::trim)
-            .is_some_and(is_responses_lifecycle_event_type)
-    })
+        })
+        || text.lines().any(|line| {
+            line.strip_prefix("event:")
+                .map(str::trim)
+                .is_some_and(is_responses_lifecycle_event_type)
+        })
 }
 
 fn stream_payload_is_responses_lifecycle_event(payload: &Value) -> bool {
@@ -6175,54 +6132,67 @@ mod tests {
     }
 
     #[test]
-    fn chat_to_responses_policy_routes_matching_target_and_model_first() {
-        let body = json!({"model":"codex-gpt-5", "messages":[{"role":"user","content":"hi"}]});
-        let mut cfg = Config::default();
-        cfg.chat_completions_to_responses_policy.enabled = true;
-        cfg.chat_completions_to_responses_policy.all_targets = false;
-        cfg.chat_completions_to_responses_policy.target_names = vec!["upstream".to_string()];
-        cfg.chat_completions_to_responses_policy.model_patterns = vec!["^codex-".to_string()];
+    fn function_tool_requests_automatically_prefer_the_compatible_endpoint() {
+        let responses = json!({
+            "model": "public-model",
+            "input": "inspect this code",
+            "tools": [{
+                "type": "function",
+                "name": "run_code",
+                "parameters": {"type": "object"}
+            }]
+        });
+        let chat = json!({
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "inspect this code"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "run_code",
+                    "parameters": {"type": "object"}
+                }
+            }]
+        });
 
         assert_eq!(
-            endpoint_candidates_for_target(
-                ProxyEndpoint::ChatCompletions,
-                &body,
-                &target(),
-                &cfg,
-            ),
+            endpoint_candidates_for_request(ProxyEndpoint::Responses, &responses),
             vec![
-                ProxyEndpoint::Responses,
                 ProxyEndpoint::ChatCompletions,
+                ProxyEndpoint::Responses,
+                ProxyEndpoint::Completions,
+            ]
+        );
+        assert_eq!(
+            endpoint_candidates_for_request(ProxyEndpoint::ChatCompletions, &chat),
+            vec![
+                ProxyEndpoint::ChatCompletions,
+                ProxyEndpoint::Responses,
                 ProxyEndpoint::Completions,
             ]
         );
     }
 
     #[test]
-    fn responses_to_chat_policy_routes_matching_target_and_model_first() {
-        let body = json!({"model":"glm-5", "input":"hi"});
-        let mut cfg = Config::default();
-        cfg.responses_to_chat_completions_policy.enabled = true;
-        cfg.responses_to_chat_completions_policy.all_targets = false;
-        cfg.responses_to_chat_completions_policy.target_names = vec!["upstream".to_string()];
-        cfg.responses_to_chat_completions_policy.model_patterns = vec!["^glm-".to_string()];
+    fn function_tool_requests_keep_native_only_when_the_request_cannot_be_converted() {
+        let stateful = json!({
+            "model": "public-model",
+            "previous_response_id": "resp_previous",
+            "tools": [{"type": "function", "name": "run_code"}]
+        });
+        let multiple_chat_choices = json!({
+            "model": "public-model",
+            "n": 2,
+            "messages": [{"role": "user", "content": "inspect this code"}],
+            "tools": [{"type": "function", "function": {"name": "run_code"}}]
+        });
 
         assert_eq!(
-            endpoint_candidates_for_target(ProxyEndpoint::Responses, &body, &target(), &cfg),
-            vec![
-                ProxyEndpoint::ChatCompletions,
-                ProxyEndpoint::Responses,
-                ProxyEndpoint::Completions,
-            ]
+            endpoint_candidates_for_request(ProxyEndpoint::Responses, &stateful),
+            vec![ProxyEndpoint::Responses]
         );
-        cfg.pass_through_request_enabled = true;
         assert_eq!(
-            endpoint_candidates_for_target(ProxyEndpoint::Responses, &body, &target(), &cfg),
-            vec![
-                ProxyEndpoint::Responses,
-                ProxyEndpoint::ChatCompletions,
-                ProxyEndpoint::Completions,
-            ]
+            endpoint_candidates_for_request(ProxyEndpoint::ChatCompletions, &multiple_chat_choices),
+            vec![ProxyEndpoint::ChatCompletions]
         );
     }
 
