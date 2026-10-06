@@ -12,10 +12,12 @@ Failover Proxy 是一个 OpenAI 兼容的大模型故障转移代理，内置可
 - 自定义代理 API Key，客户端通过 `Authorization: Bearer ...` 调用。
 - Admin Token 登录与 Session 管理，支持 `/api/login`、`/api/logout`、`/api/session`。
 - 多模型故障转移链，每个公开模型可配置有序 targets。
+- Chat Completions 与 Responses 双向适配：自动按目标端点探测并转换请求、普通响应和 SSE 流；覆盖工具调用历史、文本格式、推理片段、结束原因、用量和常见图像/音频/文件/视频内容。`previous_response_id` 等有状态字段仅在本机已有对应响应历史时展开后转换，否则保留到原生 Responses 上游。
+- 可选启用双向兼容路由：`chatCompletionsToResponsesPolicy` 可将 Chat 请求优先转发为 Responses；`responsesToChatCompletionsPolicy` 可将 Responses 请求优先降级为 Chat。两项策略均可按上游目标名和请求模型正则筛选；默认关闭，`passThroughRequestEnabled` 为 true 时不执行策略转换。未命中策略时优先请求原生端点，仅在上游明确不支持该端点时自动回退。
 - 支持上游字段：`name`、`baseUrl`、`apiKey`、`modelName`、`enabled`、`priority`、`weight`、`maxRetries`、`timeoutMs` 等。
 - 故障转移策略：`priority`、`round-robin`、`weighted`、`latency-based`。
 - 模型源模式：从自定义 `/v1/models` URL 拉取模型，支持 include/exclude 过滤、publicPrefix/publicSuffix 和 `{model}` 模板。
-- 流式 SSE/chunked 原样转发，早期分块会探测上游错误；一旦开始向客户端输出字节，中途错误只记录，不再切换上游。
+- 流式 SSE/chunked 原样转发或逐事件跨协议转换；早期分块会探测上游错误。一旦开始向客户端输出字节，中途错误只记录，不再切换上游。
 - 熔断器：连续失败阈值、冷却时间、立即冷却状态码，例如 `429`。
 - 被动故障检测：真实代理请求触发转移和熔断，管理界面健康检查只更新在线状态与延迟。
 - 代理请求不再限制每个模型的并发线程数；请求或流结束后实时线程记录立即释放。
@@ -270,13 +272,15 @@ Failover Proxy is an OpenAI-compatible LLM failover proxy with a visual manageme
   - `POST /v1/chat/completions` and `POST /chat/completions`
   - `POST /v1/responses`, `POST /responses`, `POST /v1/response`, and `POST /response`
   - `POST /v1/completions` and `POST /completions`
+- Bidirectional Chat Completions / Responses adaptation: endpoint detection converts requests, non-streaming responses, and SSE streams, including tool history, text formats, reasoning, finish reasons, usage, and common image/audio/file/video content. Stateful fields such as `previous_response_id` are expanded only when this process has the matching response history; otherwise the request stays on a native Responses endpoint.
+- Optional bidirectional compatibility routing: `chatCompletionsToResponsesPolicy` prefers Responses for matching Chat requests, while `responsesToChatCompletionsPolicy` downgrades matching Responses requests to Chat. Both policies can match target names and request-model regexes. They are disabled by default, and `passThroughRequestEnabled: true` suppresses policy conversion. Requests outside a policy use the native endpoint first and fall back only when the upstream clearly does not support it.
 - Custom proxy API keys via `Authorization: Bearer ...`.
 - Admin token login and session management with `/api/login`, `/api/logout`, and `/api/session`.
 - Multiple model failover chains. Each public model can define ordered upstream targets.
 - Each proxy model exposes its configurable `contextWindowTokens` (default 1,000,000) through `/v1/models`, and inbound requests are checked against that model's window. Target fields include `name`, `baseUrl`, `apiKey`, `modelName`, `enabled`, `priority`, `weight`, `maxRetries`, and `timeoutMs`. Failover Proxy sends the original request first. Only when an upstream returns a context-length error with HTTP 422 does it lossily compact the request context and retry that same upstream until it succeeds or the payload cannot be reduced further (with a 32-round loop-safety guard); unrelated 422 responses keep their normal error behavior.
 - Failover strategies: `priority`, `round-robin`, `weighted`, `latency-based`.
 - Model-source mode: fetch models from a custom `/v1/models` URL, apply include/exclude filters, add public prefixes/suffixes, expand `{model}` templates, and set a shared `contextWindowTokens` for the generated proxy models.
-- Streaming SSE/chunked pass-through with early upstream error probing. After bytes are written to the client, mid-stream errors are recorded but not failed over.
+- Streaming SSE/chunked pass-through or per-event protocol translation with early upstream error probing. After bytes are written to the client, mid-stream errors are recorded but not failed over.
 - Circuit breaker with failure threshold, cooldown duration, and immediate cooldown status codes such as `429`.
 - Passive failure detection: real proxy requests trigger failover and circuit breaking; UI health checks only update observed provider status and latency.
 - Proxy requests are no longer capped by per-model thread slots. Active thread records are released immediately when the request or stream finishes.

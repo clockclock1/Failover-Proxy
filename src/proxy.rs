@@ -76,10 +76,7 @@ impl ProxyEndpoint {
     fn candidates(self) -> [Self; 3] {
         match self {
             Self::ChatCompletions => [Self::ChatCompletions, Self::Responses, Self::Completions],
-            // Most third-party providers advertise a Responses path but only
-            // implement Chat Completions semantics. Prefer the well-supported
-            // Chat stream and translate it back to Responses for the caller.
-            Self::Responses => [Self::ChatCompletions, Self::Responses, Self::Completions],
+            Self::Responses => [Self::Responses, Self::ChatCompletions, Self::Completions],
             Self::Completions => [Self::Completions, Self::ChatCompletions, Self::Responses],
         }
     }
@@ -91,23 +88,123 @@ fn endpoint_candidates_for_request(requested: ProxyEndpoint, body: &Value) -> Ve
     if requested == ProxyEndpoint::Responses && responses_request_requires_native_upstream(body) {
         return vec![ProxyEndpoint::Responses];
     }
+    if requested == ProxyEndpoint::ChatCompletions && chat_request_requires_native_upstream(body) {
+        return vec![ProxyEndpoint::ChatCompletions];
+    }
     requested.candidates().to_vec()
 }
 
-fn responses_request_requires_native_upstream(body: &Value) -> bool {
-    ["previous_response_id", "include", "background"]
-        .iter()
-        .any(|field| body.get(*field).is_some_and(|value| !value.is_null()))
+fn endpoint_candidates_for_target(
+    requested: ProxyEndpoint,
+    body: &Value,
+    target: &TargetConfig,
+    cfg: &Config,
+) -> Vec<ProxyEndpoint> {
+    if !cfg.pass_through_request_enabled {
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        if requested == ProxyEndpoint::ChatCompletions
+            && cfg
+                .chat_completions_to_responses_policy
+                .is_enabled_for(target, model)
+            && !chat_request_requires_native_upstream(body)
+        {
+            return vec![
+                ProxyEndpoint::Responses,
+                ProxyEndpoint::ChatCompletions,
+                ProxyEndpoint::Completions,
+            ];
+        }
+        if requested == ProxyEndpoint::Responses
+            && cfg
+                .responses_to_chat_completions_policy
+                .is_enabled_for(target, model)
+            && !responses_request_requires_native_upstream(body)
+        {
+            return vec![
+                ProxyEndpoint::ChatCompletions,
+                ProxyEndpoint::Responses,
+                ProxyEndpoint::Completions,
+            ];
+        }
+    }
+    endpoint_candidates_for_request(requested, body)
+}
+
+fn chat_request_requires_native_upstream(body: &Value) -> bool {
+    body.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1)
         || body
-            .get("tools")
+            .get("functions")
+            .is_some_and(|functions| !functions.is_null())
+        || body
+            .get("function_call")
+            .is_some_and(|function_call| !function_call.is_null())
+        || body
+            .get("messages")
             .and_then(Value::as_array)
-            .is_some_and(|tools| {
-                tools.iter().any(|tool| {
-                    tool.get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| kind != "function")
-                })
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message.get("function_call").is_some())
             })
+}
+
+impl crate::config::ChatCompletionsToResponsesPolicy {
+    fn is_enabled_for(&self, target: &TargetConfig, model: &str) -> bool {
+        if !self.enabled || model.is_empty() {
+            return false;
+        }
+        let target_enabled =
+            self.all_targets || self.target_names.iter().any(|name| name == &target.name);
+        target_enabled
+            && !self.model_patterns.is_empty()
+            && self.model_patterns.iter().any(|pattern| {
+                !pattern.is_empty()
+                    && regex::Regex::new(pattern).is_ok_and(|compiled| compiled.is_match(model))
+            })
+    }
+}
+
+impl crate::config::ResponsesToChatCompletionsPolicy {
+    fn is_enabled_for(&self, target: &TargetConfig, model: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let target_enabled =
+            self.all_targets || self.target_names.iter().any(|name| name == &target.name);
+        target_enabled
+            && (self.model_patterns.is_empty()
+                || (!model.is_empty()
+                    && self.model_patterns.iter().any(|pattern| {
+                        !pattern.is_empty()
+                            && regex::Regex::new(pattern)
+                                .is_ok_and(|compiled| compiled.is_match(model))
+                    })))
+    }
+}
+
+fn responses_request_requires_native_upstream(body: &Value) -> bool {
+    [
+        "previous_response_id",
+        "conversation",
+        "prompt",
+        "context_management",
+        "include",
+        "background",
+    ]
+    .iter()
+    .any(|field| {
+        body.get(*field)
+            .is_some_and(|value| !value.is_null() && value != &Value::Bool(false))
+    }) || body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "function")
+            })
+        })
 }
 
 struct CompatibleUpstream {
@@ -1506,7 +1603,7 @@ async fn call_target(
     requested_endpoint: ProxyEndpoint,
 ) -> Result<CompatibleUpstream, ProxyCallError> {
     let timeout = target_timeout(target, cfg);
-    let candidates = endpoint_candidates_for_request(requested_endpoint, body);
+    let candidates = endpoint_candidates_for_target(requested_endpoint, body, target, cfg);
     let api_key = state
         .proxy_runtime
         .select_target_api_key(model, target)
@@ -1524,11 +1621,17 @@ async fn call_target(
             .header(header::CONTENT_TYPE, "application/json")
             .bearer_auth(&api_key)
             .body(serde_json::to_vec(&next_body).unwrap_or_default());
+        if upstream_stream {
+            req = req.header(header::ACCEPT, "text/event-stream");
+        }
         if let Some(value) = inbound_headers.get("openai-organization") {
             req = req.header("openai-organization", value);
         }
         if let Some(value) = inbound_headers.get("openai-project") {
             req = req.header("openai-project", value);
+        }
+        if let Some(value) = inbound_headers.get("openai-beta") {
+            req = req.header("openai-beta", value);
         }
         let response = if upstream_stream {
             match tokio::time::timeout(timeout, req.send()).await {
@@ -1841,6 +1944,12 @@ fn build_upstream_body(
                     "user",
                     "metadata",
                     "parallel_tool_calls",
+                    "service_tier",
+                    "store",
+                    "safety_identifier",
+                    "prompt_cache_key",
+                    "prompt_cache_retention",
+                    "top_logprobs",
                 ],
             );
             if requested == ProxyEndpoint::Responses {
@@ -1861,13 +1970,17 @@ fn build_upstream_body(
                         out.insert("response_format".to_string(), response_format);
                     }
                 }
+                if let Some(reasoning) = responses_reasoning_to_chat(body.get("reasoning")) {
+                    out.insert("reasoning_effort".to_string(), reasoning);
+                }
             } else {
                 copy_request_fields(body, &mut out, &["tools", "tool_choice"]);
             }
-            if let Some(value) = body
-                .get("max_tokens")
-                .or_else(|| body.get("max_output_tokens"))
-            {
+            if requested == ProxyEndpoint::Responses {
+                if let Some(value) = body.get("max_output_tokens") {
+                    out.insert("max_completion_tokens".to_string(), value.clone());
+                }
+            } else if let Some(value) = body.get("max_tokens") {
                 out.insert("max_tokens".to_string(), value.clone());
             }
         }
@@ -1885,20 +1998,56 @@ fn build_upstream_body(
                 &[
                     "temperature",
                     "top_p",
-                    "tools",
-                    "tool_choice",
-                    "response_format",
-                    "reasoning",
                     "truncation",
                     "metadata",
                     "user",
+                    "store",
+                    "parallel_tool_calls",
+                    "prompt_cache_key",
+                    "service_tier",
+                    "safety_identifier",
+                    "prompt_cache_retention",
+                    "top_logprobs",
+                    "frequency_penalty",
+                    "presence_penalty",
                 ],
             );
-            if let Some(value) = body
-                .get("max_output_tokens")
-                .or_else(|| body.get("max_tokens"))
-            {
-                out.insert("max_output_tokens".to_string(), value.clone());
+            if requested == ProxyEndpoint::ChatCompletions {
+                if let Some(tools) = body.get("tools") {
+                    out.insert("tools".to_string(), chat_tools_to_responses(tools));
+                }
+                if let Some(tool_choice) = body.get("tool_choice") {
+                    out.insert(
+                        "tool_choice".to_string(),
+                        chat_tool_choice_to_responses(tool_choice),
+                    );
+                }
+                if let Some(format) = body.get("response_format") {
+                    out.insert(
+                        "text".to_string(),
+                        chat_response_format_to_responses(format),
+                    );
+                }
+                if let Some(reasoning) = body
+                    .get("reasoning_effort")
+                    .or_else(|| body.get("reasoning"))
+                {
+                    out.insert(
+                        "reasoning".to_string(),
+                        reasoning_effort_to_responses(reasoning),
+                    );
+                }
+                if let Some(value) = body
+                    .get("max_completion_tokens")
+                    .or_else(|| body.get("max_tokens"))
+                {
+                    out.insert("max_output_tokens".to_string(), value.clone());
+                }
+            } else {
+                copy_request_fields(body, &mut out, &["tools", "tool_choice", "text"]);
+                if let Some(value) = body.get("max_tokens") {
+                    out.insert("max_output_tokens".to_string(), value.clone());
+                }
             }
         }
         ProxyEndpoint::Completions => {
@@ -1993,52 +2142,131 @@ fn request_to_chat_messages(body: &Value, requested: ProxyEndpoint) -> Vec<Value
 fn responses_input_to_chat_messages(input: Option<&Value>) -> Vec<Value> {
     match input {
         Some(Value::String(text)) => vec![chat_message("user", text)],
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(response_input_item_to_chat_message)
-            .collect(),
+        Some(Value::Array(items)) => {
+            let mut messages = Vec::new();
+            let mut pending_media = Vec::new();
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                let is_tool_output = matches!(
+                    item_type,
+                    "function_call_output" | "custom_tool_call_output"
+                );
+                if !pending_media.is_empty() && !is_tool_output {
+                    messages.push(json!({"role": "user", "content": Value::Array(std::mem::take(&mut pending_media))}));
+                }
+                match item_type {
+                    "function_call" | "custom_tool_call" => {
+                        append_responses_tool_call_to_chat(&mut messages, item);
+                    }
+                    "function_call_output" | "custom_tool_call_output" => {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let output = item
+                            .get("output")
+                            .or_else(|| item.get("result"))
+                            .unwrap_or(&Value::Null);
+                        let (content, media) = responses_tool_output_to_chat(output);
+                        messages.push(
+                            json!({"role": "tool", "tool_call_id": call_id, "content": content}),
+                        );
+                        pending_media.extend(media);
+                    }
+                    _ => {
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let role = if role == "developer" { "system" } else { role };
+                        messages.push(json!({
+                            "role": role,
+                            "content": map_content_parts(item.get("content"), true),
+                        }));
+                    }
+                }
+            }
+            if !pending_media.is_empty() {
+                messages.push(json!({"role": "user", "content": Value::Array(pending_media)}));
+            }
+            messages
+        }
         Some(value) => vec![chat_message("user", value_to_text(value))],
         None => Vec::new(),
     }
 }
 
-fn response_input_item_to_chat_message(item: &Value) -> Value {
-    match item.get("type").and_then(Value::as_str) {
-        Some("function_call") => {
-            let call_id = item
-                .get("call_id")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-            let arguments = item.get("arguments").map(value_to_text).unwrap_or_default();
-            json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments}
-                }]
-            })
-        }
-        Some("function_call_output") => json!({
-            "role": "tool",
-            "tool_call_id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
-            "content": value_to_text(item.get("output").unwrap_or(&Value::Null))
-        }),
-        _ if item.get("role").is_some() || item.get("content").is_some() => {
-            let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-            // Many OpenAI-compatible Chat endpoints accept `system` but reject
-            // the newer Responses `developer` role.
-            let role = if role == "developer" { "system" } else { role };
-            json!({
-                "role": role,
-                "content": map_content_parts(item.get("content"), true)
-            })
-        }
-        _ => chat_message("user", value_to_text(item)),
+fn append_responses_tool_call_to_chat(messages: &mut Vec<Value>, item: &Value) {
+    let mut call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if call_id.is_empty() {
+        call_id = format!("call_{}", now_ms());
     }
+    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    let arguments = if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        let input = item.get("input").cloned().unwrap_or(Value::Null);
+        json!({"input": input}).to_string()
+    } else {
+        item.get("arguments")
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                _ => value.to_string(),
+            })
+            .unwrap_or_default()
+    };
+    let call = json!({
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments}
+    });
+    if let Some(last) = messages
+        .last_mut()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+    {
+        if let Some(tool_calls) = last.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            tool_calls.push(call);
+            return;
+        }
+        last.as_object_mut().map(|object| {
+            object.insert("tool_calls".to_string(), Value::Array(vec![call]));
+            if object.get("content").is_none() {
+                object.insert("content".to_string(), Value::Null);
+            }
+        });
+        return;
+    }
+    messages.push(json!({"role": "assistant", "content": Value::Null, "tool_calls": [call]}));
+}
+
+fn responses_tool_output_to_chat(output: &Value) -> (Value, Vec<Value>) {
+    let Some(parts) = output.as_array() else {
+        return (Value::String(value_to_text(output)), Vec::new());
+    };
+    let mut text = Vec::new();
+    let mut media = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "input_text" | "output_text" | "text" => {
+                if let Some(value) = part.get("text") {
+                    let value = value_to_text(value);
+                    if !value.is_empty() {
+                        text.push(value);
+                    }
+                }
+            }
+            "input_image" | "input_file" | "input_audio" | "input_video" => {
+                media.push(map_content_part(part, true));
+            }
+            _ => return (Value::String(value_to_text(output)), Vec::new()),
+        }
+    }
+    let content = if text.is_empty() && !media.is_empty() {
+        Value::String("[tool output contains media]".to_string())
+    } else {
+        Value::String(text.join("\n"))
+    };
+    (content, media)
 }
 
 fn responses_tools_to_chat(tools: &Value) -> Value {
@@ -2052,15 +2280,16 @@ fn responses_tools_to_chat(tools: &Value) -> Value {
                         if tool.get("type").and_then(Value::as_str) == Some("function")
                             && tool.get("function").is_none()
                         {
-                            json!({
-                                "type": "function",
-                                "function": {
-                                    "name": tool.get("name").and_then(Value::as_str).unwrap_or_default(),
-                                    "description": tool.get("description").cloned().unwrap_or(Value::Null),
-                                    "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({})),
-                                    "strict": tool.get("strict").cloned().unwrap_or(Value::Null),
+                            let mut function = serde_json::Map::new();
+                            for field in ["name", "description", "parameters", "strict"] {
+                                if let Some(value) = tool.get(field) {
+                                    function.insert(field.to_string(), value.clone());
                                 }
-                            })
+                            }
+                            function
+                                .entry("parameters".to_string())
+                                .or_insert_with(|| json!({}));
+                            json!({"type":"function","function":Value::Object(function)})
                         } else {
                             tool.clone()
                         }
@@ -2075,13 +2304,103 @@ fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
     if tool_choice.get("type").and_then(Value::as_str) == Some("function")
         && tool_choice.get("function").is_none()
     {
-        json!({
-            "type": "function",
-            "function": {"name": tool_choice.get("name").and_then(Value::as_str).unwrap_or_default()}
-        })
+        if let Some(name) = tool_choice
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            json!({
+                "type": "function",
+                "function": {"name": name}
+            })
+        } else {
+            tool_choice.clone()
+        }
     } else {
         tool_choice.clone()
     }
+}
+
+fn chat_tools_to_responses(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|tool| {
+                        if tool.get("type").and_then(Value::as_str) != Some("function") {
+                            return tool.clone();
+                        }
+                        let function = tool.get("function").unwrap_or(tool);
+                        let mut converted = serde_json::Map::new();
+                        converted.insert("type".to_string(), Value::String("function".to_string()));
+                        for field in ["name", "description", "parameters", "strict"] {
+                            if let Some(value) = function.get(field) {
+                                converted.insert(field.to_string(), value.clone());
+                            }
+                        }
+                        Value::Object(converted)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+fn chat_tool_choice_to_responses(tool_choice: &Value) -> Value {
+    if tool_choice.get("type").and_then(Value::as_str) == Some("function") {
+        let name = tool_choice
+            .get("name")
+            .or_else(|| tool_choice.pointer("/function/name"));
+        if let Some(name) = name {
+            let mut converted = serde_json::Map::new();
+            converted.insert("type".to_string(), Value::String("function".to_string()));
+            converted.insert("name".to_string(), name.clone());
+            return Value::Object(converted);
+        }
+    }
+    tool_choice.clone()
+}
+
+fn chat_response_format_to_responses(response_format: &Value) -> Value {
+    let Some(kind) = response_format.get("type").and_then(Value::as_str) else {
+        return json!({"format": response_format});
+    };
+    let mut format = serde_json::Map::new();
+    format.insert("type".to_string(), Value::String(kind.to_string()));
+    if kind == "json_schema" {
+        if let Some(schema) = response_format.get("json_schema") {
+            for field in ["name", "description", "schema", "strict"] {
+                if let Some(value) = schema.get(field) {
+                    format.insert(field.to_string(), value.clone());
+                }
+            }
+            // Some Chat-compatible providers already send the flattened Responses shape.
+            for (key, value) in schema.as_object().into_iter().flatten() {
+                if !format.contains_key(key) && key != "json_schema" {
+                    format.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    json!({"format": Value::Object(format)})
+}
+
+fn reasoning_effort_to_responses(value: &Value) -> Value {
+    if value.is_object() {
+        value.clone()
+    } else {
+        json!({"effort": value})
+    }
+}
+
+fn responses_reasoning_to_chat(value: Option<&Value>) -> Option<Value> {
+    let reasoning = value?;
+    reasoning
+        .get("effort")
+        .cloned()
+        .or_else(|| reasoning.as_str().map(|_| reasoning.clone()))
 }
 
 fn responses_text_format_to_chat_response_format(text: &Value) -> Option<Value> {
@@ -2103,31 +2422,205 @@ fn responses_text_format_to_chat_response_format(text: &Value) -> Option<Value> 
 
 fn request_to_responses_input(body: &Value, requested: ProxyEndpoint) -> Value {
     match requested {
-        ProxyEndpoint::Responses => body.get("input").cloned().unwrap_or(Value::String(String::new())),
-        ProxyEndpoint::ChatCompletions => Value::Array(
-            body.get("messages")
+        ProxyEndpoint::Responses => body
+            .get("input")
+            .cloned()
+            .unwrap_or(Value::String(String::new())),
+        ProxyEndpoint::ChatCompletions => {
+            let mut input = Vec::new();
+            for message in body
+                .get("messages")
                 .and_then(Value::as_array)
-                .map(|messages| {
-                    messages
-                        .iter()
-                        .filter(|message| {
-                            !message
-                                .get("role")
-                                .and_then(Value::as_str)
-                                .is_some_and(|role| role == "system" || role == "developer")
-                        })
-                        .map(|message| {
-                            json!({
-                                "role": message.get("role").and_then(Value::as_str).unwrap_or("user"),
-                                "content": map_content_parts(message.get("content"), false)
+                .into_iter()
+                .flatten()
+            {
+                let role = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user");
+                if role == "system" || role == "developer" {
+                    continue;
+                }
+                if role == "tool" || role == "function" {
+                    let call_id = message
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    let output = message.get("content").unwrap_or(&Value::Null);
+                    if call_id.is_empty() {
+                        input.push(json!({
+                            "role": "user",
+                            "content": format!("[tool_output_missing_call_id] {}", value_to_text(output)),
+                        }));
+                    } else {
+                        input.push(json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": chat_tool_output_to_responses(output),
+                        }));
+                    }
+                    continue;
+                }
+
+                let content = map_chat_content_to_responses(message.get("content"), role);
+                let tool_calls = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if !content_is_empty(&content) || tool_calls.is_empty() {
+                    input.push(json!({"role": role, "content": content}));
+                }
+                if role == "assistant" {
+                    for call in tool_calls {
+                        if call
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind != "function")
+                        {
+                            continue;
+                        }
+                        let function = call.get("function").unwrap_or(&call);
+                        let call_id = call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim();
+                        let name = function
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim();
+                        if call_id.is_empty() || name.is_empty() {
+                            continue;
+                        }
+                        let arguments = function
+                            .get("arguments")
+                            .map(|value| match value {
+                                Value::String(text) => text.clone(),
+                                _ => value.to_string(),
                             })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-        ),
+                            .unwrap_or_default();
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        }));
+                    }
+                }
+            }
+            Value::Array(input)
+        }
         ProxyEndpoint::Completions => Value::String(request_to_prompt(body, requested)),
     }
+}
+
+fn content_is_empty(content: &Value) -> bool {
+    match content {
+        Value::Null => true,
+        Value::String(text) => text.is_empty(),
+        Value::Array(parts) => parts.is_empty(),
+        _ => false,
+    }
+}
+
+fn chat_tool_output_to_responses(output: &Value) -> Value {
+    match output {
+        Value::String(text) => Value::String(text.clone()),
+        Value::Null => Value::String(String::new()),
+        Value::Array(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| map_chat_content_part_to_responses(part, "user"))
+                .collect(),
+        ),
+        _ => output.clone(),
+    }
+}
+
+fn map_chat_content_to_responses(content: Option<&Value>, role: &str) -> Value {
+    match content {
+        Some(Value::Array(parts)) => Value::Array(
+            parts
+                .iter()
+                .map(|part| map_chat_content_part_to_responses(part, role))
+                .collect(),
+        ),
+        Some(value) => value.clone(),
+        None => Value::String(String::new()),
+    }
+}
+
+fn map_chat_content_part_to_responses(part: &Value, role: &str) -> Value {
+    let mut next = part.clone();
+    let Some(obj) = next.as_object_mut() else {
+        return next;
+    };
+    let Some(kind) = obj.get("type").and_then(Value::as_str).map(str::to_string) else {
+        return next;
+    };
+    match kind.as_str() {
+        "text" => {
+            obj.insert(
+                "type".to_string(),
+                Value::String(
+                    if role == "assistant" {
+                        "output_text"
+                    } else {
+                        "input_text"
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+        "image_url" => {
+            let image = obj.get("image_url").cloned();
+            let detail = image
+                .as_ref()
+                .and_then(|value| value.get("detail"))
+                .cloned();
+            let url = match image {
+                Some(Value::Object(image)) => image.get("url").cloned(),
+                Some(Value::String(url)) => Some(Value::String(url)),
+                _ => None,
+            };
+            obj.insert("type".to_string(), Value::String("input_image".to_string()));
+            if let Some(url) = url {
+                obj.insert("image_url".to_string(), url);
+            }
+            if obj.get("detail").is_none() {
+                if let Some(detail) = detail {
+                    obj.insert("detail".to_string(), detail);
+                }
+            }
+        }
+        "file" => {
+            let file = obj.get("file").cloned();
+            obj.insert("type".to_string(), Value::String("input_file".to_string()));
+            if let Some(Value::Object(file)) = file {
+                for (source, target) in [
+                    ("file_id", "file_id"),
+                    ("file_data", "file_url"),
+                    ("filename", "filename"),
+                ] {
+                    if let Some(value) = file.get(source) {
+                        obj.insert(target.to_string(), value.clone());
+                    }
+                }
+                obj.remove("file");
+            }
+        }
+        "video_url" => {
+            obj.insert("type".to_string(), Value::String("input_video".to_string()));
+            if let Some(video_url) = obj.remove("video_url") {
+                obj.insert("video_url".to_string(), video_url);
+            }
+        }
+        _ => {}
+    }
+    next
 }
 
 fn request_instructions(body: &Value, requested: ProxyEndpoint) -> Option<String> {
@@ -2149,15 +2642,30 @@ fn request_instructions(body: &Value, requested: ProxyEndpoint) -> Option<String
                     .and_then(Value::as_str)
                     .is_some_and(|role| role == "system" || role == "developer")
             })
-            .map(|message| value_to_text(message.get("content").unwrap_or(&Value::Null)))
+            .map(|message| chat_instruction_text(message.get("content")))
             .filter(|text| !text.trim().is_empty())
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n\n");
         if !instructions.is_empty() {
             return Some(instructions);
         }
     }
     None
+}
+
+fn chat_instruction_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(value) => value_to_text(value),
+        None => String::new(),
+    }
 }
 
 fn request_to_prompt(body: &Value, requested: ProxyEndpoint) -> String {
@@ -2280,6 +2788,61 @@ fn map_content_part(part: &Value, to_chat: bool) -> Value {
                 }
             }
         }
+        (true, "input_file") => {
+            let file = obj.clone();
+            obj.insert("type".to_string(), Value::String("file".to_string()));
+            let mut chat_file = serde_json::Map::new();
+            if let Some(file_id) = file.get("file_id") {
+                chat_file.insert("file_id".to_string(), file_id.clone());
+            }
+            if let Some(file_url) = file.get("file_url") {
+                chat_file.insert("file_data".to_string(), file_url.clone());
+            }
+            if let Some(filename) = file.get("filename") {
+                chat_file.insert("filename".to_string(), filename.clone());
+            }
+            if let Some(value) = file.get("file") {
+                chat_file.insert("file_data".to_string(), value.clone());
+            }
+            obj.remove("file_id");
+            obj.remove("file_url");
+            obj.remove("filename");
+            obj.insert("file".to_string(), Value::Object(chat_file));
+        }
+        (true, "input_video") => {
+            let video_url = obj
+                .get("video_url")
+                .cloned()
+                .or_else(|| obj.get("url").cloned());
+            obj.insert("type".to_string(), Value::String("video_url".to_string()));
+            obj.remove("url");
+            if let Some(video_url) = video_url {
+                obj.insert("video_url".to_string(), video_url);
+            }
+        }
+        (false, "file") => {
+            let file = obj.get("file").cloned();
+            obj.insert("type".to_string(), Value::String("input_file".to_string()));
+            if let Some(Value::Object(file)) = file {
+                for (field, target_field) in [
+                    ("file_id", "file_id"),
+                    ("file_data", "file_url"),
+                    ("filename", "filename"),
+                ] {
+                    if let Some(value) = file.get(field) {
+                        obj.insert(target_field.to_string(), value.clone());
+                    }
+                }
+                obj.remove("file");
+            }
+        }
+        (false, "video_url") => {
+            let video_url = obj.get("video_url").cloned();
+            obj.insert("type".to_string(), Value::String("input_video".to_string()));
+            if let Some(video_url) = video_url {
+                obj.insert("video_url".to_string(), video_url);
+            }
+        }
         _ => {}
     }
     next
@@ -2327,7 +2890,37 @@ fn response_as_chat(
     target: &TargetConfig,
 ) -> Value {
     let text = response_text(upstream, payload);
-    let finish_reason = response_finish_reason(payload);
+    let reasoning = if upstream == ProxyEndpoint::Responses {
+        responses_reasoning_text(payload)
+    } else {
+        payload
+            .pointer("/choices/0/message/reasoning_content")
+            .or_else(|| payload.pointer("/choices/0/message/reasoning"))
+            .map(value_to_text)
+            .unwrap_or_default()
+    };
+    let tool_calls = response_tool_calls_for_chat(upstream, payload);
+    let finish_reason = if upstream == ProxyEndpoint::Responses {
+        responses_finish_reason(payload, !tool_calls.is_empty())
+    } else {
+        response_finish_reason(payload)
+    };
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    message.insert("content".to_string(), Value::String(text));
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), Value::String(reasoning));
+    }
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    if let Some(refusal) = response_refusal(upstream, payload) {
+        message.insert("refusal".to_string(), refusal);
+    }
+    let annotations = response_annotations_for_chat(upstream, payload);
+    if !annotations.is_empty() {
+        message.insert("annotations".to_string(), Value::Array(annotations));
+    }
     json!({
         "id": response_id(payload, "chatcmpl"),
         "object": "chat.completion",
@@ -2335,14 +2928,10 @@ fn response_as_chat(
         "model": requested_model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": text,
-                "refusal": Value::Null,
-            },
+            "message": Value::Object(message),
             "finish_reason": finish_reason,
         }],
-        "usage": payload.get("usage").cloned().unwrap_or_else(|| json!({})),
+        "usage": usage_as_chat(upstream, payload.get("usage")),
         "failover_proxy_upstream": {
             "endpoint": upstream.suffix(),
             "target": target.name,
@@ -2358,22 +2947,37 @@ fn response_as_responses(
     target: &TargetConfig,
 ) -> Value {
     let text = response_text(upstream, payload);
-    let output = responses_output_from_upstream(upstream, payload, &text);
-    json!({
+    let mut output = responses_output_from_upstream(upstream, payload, &text);
+    let finish_reason = response_finish_reason(payload);
+    let (status, incomplete_details) = match finish_reason.as_str() {
+        "length" => ("incomplete", Some(json!({"reason": "max_output_tokens"}))),
+        "content_filter" => ("incomplete", Some(json!({"reason": "content_filter"}))),
+        _ => ("completed", None),
+    };
+    if status == "incomplete" {
+        for item in &mut output {
+            item["status"] = Value::String("incomplete".to_string());
+        }
+    }
+    let mut converted = json!({
         "id": response_id(payload, "resp"),
         "object": "response",
         "created_at": response_created(payload),
-        "status": "completed",
+        "status": status,
         "model": requested_model,
         "output": output,
         "output_text": text,
-        "usage": payload.get("usage").cloned().unwrap_or_else(|| json!({})),
+        "usage": usage_as_responses(upstream, payload.get("usage")),
         "failover_proxy_upstream": {
             "endpoint": upstream.suffix(),
             "target": target.name,
             "model": target.model_name,
         }
-    })
+    });
+    if let Some(details) = incomplete_details {
+        converted["incomplete_details"] = details;
+    }
+    converted
 }
 
 fn responses_output_from_upstream(
@@ -2390,45 +2994,100 @@ fn responses_output_from_upstream(
     }
 
     let mut output = Vec::new();
-    if !text.is_empty() {
-        output.push(json!({
+    if upstream == ProxyEndpoint::ChatCompletions {
+        let reasoning = payload
+            .pointer("/choices/0/message/reasoning_content")
+            .or_else(|| payload.pointer("/choices/0/message/reasoning"))
+            .map(value_to_text)
+            .unwrap_or_default();
+        if !reasoning.is_empty() {
+            output.push(json!({
+                "type": "reasoning",
+                "id": format!("rs_{}", response_id(payload, "resp")),
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            }));
+        }
+    }
+    let refusal = if upstream == ProxyEndpoint::ChatCompletions {
+        payload
+            .pointer("/choices/0/message/refusal")
+            .cloned()
+            .filter(|value| !value.is_null())
+    } else {
+        None
+    };
+    if !text.is_empty() || refusal.is_some() {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(json!({"type":"output_text","text":text,"annotations":[]}));
+        }
+        if let Some(refusal) = refusal {
+            content.push(json!({"type":"refusal","refusal":refusal}));
+        }
+        let mut message = json!({
             "type": "message",
             "id": format!("msg_{}", now_ms()),
             "status": "completed",
             "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": text,
-                "annotations": []
-            }]
-        }));
+            "content": content
+        });
+        let annotations = response_annotations_for_responses(upstream, payload);
+        if !text.is_empty() {
+            if let Some(content) = message.pointer_mut("/content/0") {
+                content["annotations"] = Value::Array(annotations);
+            }
+        }
+        output.push(message);
     }
-    for call in assistant_tool_calls(payload) {
+    for (index, call) in assistant_tool_calls(payload).into_iter().enumerate() {
         let function = call.get("function").unwrap_or(&call);
         let call_id = call
-            .get("id")
-            .or_else(|| call.get("call_id"))
+            .get("call_id")
+            .or_else(|| call.get("id"))
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("call_{}_{index}", now_ms()));
         let name = function
             .get("name")
             .or_else(|| call.get("name"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let arguments = function
-            .get("arguments")
-            .or_else(|| call.get("arguments"))
-            .map(value_to_text)
-            .unwrap_or_default();
         if !name.is_empty() {
-            output.push(json!({
-                "type": "function_call",
-                "id": format!("fc_{}", call_id),
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-                "status": "completed"
-            }));
+            let item_type = if call.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+            {
+                "custom_tool_call"
+            } else {
+                "function_call"
+            };
+            let arguments = function
+                .get("arguments")
+                .or_else(|| call.get("arguments"))
+                .map(value_to_text)
+                .unwrap_or_default();
+            if item_type == "custom_tool_call" {
+                let input = serde_json::from_str::<Value>(&arguments)
+                    .ok()
+                    .and_then(|value| value.get("input").cloned())
+                    .unwrap_or_else(|| Value::String(arguments));
+                output.push(json!({
+                    "type": item_type,
+                    "id": format!("fc_{}", call_id),
+                    "call_id": call_id,
+                    "name": name,
+                    "input": input,
+                    "status": "completed"
+                }));
+            } else {
+                output.push(json!({
+                    "type": item_type,
+                    "id": format!("fc_{}", call_id),
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                    "status": "completed"
+                }));
+            }
         }
     }
     if output.is_empty() {
@@ -2462,7 +3121,7 @@ fn response_as_completions(
             "logprobs": Value::Null,
             "finish_reason": finish_reason
         }],
-        "usage": payload.get("usage").cloned().unwrap_or_else(|| json!({})),
+        "usage": usage_as_chat(upstream, payload.get("usage")),
         "failover_proxy_upstream": {
             "endpoint": upstream.suffix(),
             "target": target.name,
@@ -2488,33 +3147,364 @@ fn response_text(upstream: ProxyEndpoint, payload: &Value) -> String {
 }
 
 fn responses_output_text(payload: &Value) -> String {
-    payload
-        .get("output")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .flat_map(|item| {
-                    item.get("content")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
-                })
-                .map(|part| value_to_text(&part))
-                .filter(|text| !text.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
+    let items = payload.get("output").and_then(Value::as_array);
+    let Some(items) = items else {
+        return String::new();
+    };
+    let extract = |item: &Value| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("output_text" | "text")
+                )
+            })
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>()
+    };
+    let assistant_text = items
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                    == "assistant"
         })
-        .unwrap_or_default()
+        .map(extract)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if !assistant_text.is_empty() {
+        return assistant_text.join("\n");
+    }
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .map(extract)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn response_finish_reason(payload: &Value) -> String {
-    payload
+    if let Some(reason) = payload
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str)
         .or_else(|| payload.get("finish_reason").and_then(Value::as_str))
-        .unwrap_or("stop")
-        .to_string()
+    {
+        return reason.to_string();
+    }
+    if payload.get("status").and_then(Value::as_str) == Some("incomplete") {
+        return match payload
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("content_filter") => "content_filter".to_string(),
+            _ => "length".to_string(),
+        };
+    }
+    "stop".to_string()
+}
+
+fn responses_finish_reason(payload: &Value, has_tool_calls: bool) -> String {
+    if payload.get("status").and_then(Value::as_str) == Some("incomplete") {
+        return match payload
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("content_filter") => "content_filter".to_string(),
+            _ => "length".to_string(),
+        };
+    }
+    if has_tool_calls {
+        "tool_calls".to_string()
+    } else {
+        "stop".to_string()
+    }
+}
+
+fn response_tool_calls_for_chat(upstream: ProxyEndpoint, payload: &Value) -> Vec<Value> {
+    let calls = assistant_tool_calls(payload);
+    calls
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            let kind = call
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("function_call");
+            if upstream == ProxyEndpoint::Responses
+                && !matches!(kind, "function_call" | "custom_tool_call")
+            {
+                return None;
+            }
+            let function = call.get("function").unwrap_or(&call);
+            let name = function
+                .get("name")
+                .or_else(|| call.get("name"))
+                .and_then(Value::as_str)?;
+            let id = call
+                .get("call_id")
+                .or_else(|| call.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{}_{index}", now_ms()));
+            let arguments = if kind == "custom_tool_call" {
+                json!({"input": call.get("input").cloned().unwrap_or(Value::Null)}).to_string()
+            } else {
+                function
+                    .get("arguments")
+                    .map(|value| match value {
+                        Value::String(text) => text.clone(),
+                        _ => value.to_string(),
+                    })
+                    .unwrap_or_default()
+            };
+            Some(json!({
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments}
+            }))
+        })
+        .collect()
+}
+
+fn responses_reasoning_text(payload: &Value) -> String {
+    payload
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .map(|item| {
+            let content_text = item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            if content_text.is_empty() {
+                item.get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                content_text.join("\n")
+            }
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn response_refusal(upstream: ProxyEndpoint, payload: &Value) -> Option<Value> {
+    if upstream == ProxyEndpoint::ChatCompletions {
+        return payload
+            .pointer("/choices/0/message/refusal")
+            .cloned()
+            .filter(|value| !value.is_null());
+    }
+    payload
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+        .and_then(|part| part.get("refusal").cloned())
+}
+
+fn response_annotations_for_chat(upstream: ProxyEndpoint, payload: &Value) -> Vec<Value> {
+    let annotations = if upstream == ProxyEndpoint::ChatCompletions {
+        payload
+            .pointer("/choices/0/message/annotations")
+            .and_then(Value::as_array)
+    } else {
+        None
+    };
+    if let Some(annotations) = annotations {
+        return annotations.clone();
+    }
+    payload
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .flat_map(|part| {
+            part.get("annotations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .map(|annotation| {
+            if annotation.get("type").and_then(Value::as_str) == Some("url_citation")
+                && annotation.get("url_citation").is_none()
+            {
+                let mut citation = annotation.clone();
+                if let Some(object) = citation.as_object_mut() {
+                    object.remove("type");
+                }
+                json!({"type": "url_citation", "url_citation": citation})
+            } else {
+                annotation.clone()
+            }
+        })
+        .collect()
+}
+
+fn chat_annotation_to_responses(annotation: &Value) -> Value {
+    if annotation.get("type").and_then(Value::as_str) == Some("url_citation") {
+        if let Some(citation) = annotation.get("url_citation").and_then(Value::as_object) {
+            let mut flattened = citation.clone();
+            flattened.insert(
+                "type".to_string(),
+                Value::String("url_citation".to_string()),
+            );
+            return Value::Object(flattened);
+        }
+    }
+    annotation.clone()
+}
+
+fn response_annotation_to_chat(annotation: Value) -> Value {
+    if annotation.get("type").and_then(Value::as_str) == Some("url_citation")
+        && annotation.get("url_citation").is_none()
+    {
+        let mut citation = annotation.clone();
+        if let Some(object) = citation.as_object_mut() {
+            object.remove("type");
+        }
+        json!({"type":"url_citation","url_citation":citation})
+    } else {
+        annotation
+    }
+}
+
+fn response_annotations_for_responses(upstream: ProxyEndpoint, payload: &Value) -> Vec<Value> {
+    if upstream == ProxyEndpoint::Responses {
+        return payload
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+            .flat_map(|item| {
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|part| {
+                part.get("annotations")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .cloned()
+            .collect();
+    }
+    payload
+        .pointer("/choices/0/message/annotations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|annotation| {
+            if annotation.get("type").and_then(Value::as_str) == Some("url_citation") {
+                let citation = annotation
+                    .get("url_citation")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                citation
+                    .as_object()
+                    .map(|citation| {
+                        let mut flattened = citation.clone();
+                        flattened.insert(
+                            "type".to_string(),
+                            Value::String("url_citation".to_string()),
+                        );
+                        Value::Object(flattened)
+                    })
+                    .unwrap_or_else(|| annotation.clone())
+            } else {
+                annotation.clone()
+            }
+        })
+        .collect()
+}
+
+fn usage_as_chat(upstream: ProxyEndpoint, usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else { return json!({}) };
+    if upstream != ProxyEndpoint::Responses {
+        return usage.clone();
+    }
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut result = json!({
+        "prompt_tokens": input,
+        "completion_tokens": output,
+        "total_tokens": usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(input + output),
+    });
+    if let Some(details) = usage.get("input_tokens_details") {
+        result["prompt_tokens_details"] = details.clone();
+    }
+    if let Some(details) = usage.get("output_tokens_details") {
+        result["completion_tokens_details"] = details.clone();
+    }
+    result
+}
+
+fn usage_as_responses(upstream: ProxyEndpoint, usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else { return json!({}) };
+    if upstream == ProxyEndpoint::Responses {
+        return usage.clone();
+    }
+    let input = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut result = json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(input + output),
+    });
+    if let Some(details) = usage.get("prompt_tokens_details") {
+        result["input_tokens_details"] = details.clone();
+    }
+    if let Some(details) = usage.get("completion_tokens_details") {
+        result["output_tokens_details"] = details.clone();
+    }
+    result
 }
 
 fn response_created(payload: &Value) -> u64 {
@@ -2589,13 +3579,62 @@ fn synthetic_sse_text(endpoint: ProxyEndpoint, payload: &Value) -> String {
             let chunk_id = response_id(payload, "chatcmpl");
             let created = response_created(payload);
             let model = payload.get("model").and_then(Value::as_str).unwrap_or("");
-            let first = json!({
+            let message = payload
+                .pointer("/choices/0/message")
+                .unwrap_or(&Value::Null);
+            let reasoning = message
+                .get("reasoning_content")
+                .or_else(|| message.get("reasoning"))
+                .map(value_to_text)
+                .unwrap_or_default();
+            let mut delta = json!({"role": "assistant"});
+            if !text.is_empty() {
+                delta["content"] = Value::String(text);
+            }
+            if !reasoning.is_empty() {
+                delta["reasoning_content"] = Value::String(reasoning);
+            }
+            if let Some(refusal) = message.get("refusal").filter(|value| !value.is_null()) {
+                delta["refusal"] = refusal.clone();
+            }
+            let mut events = vec![sse_data(json!({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": Value::Null}]
-            });
+                "choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}]
+            }))];
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for (index, call) in tool_calls.iter().enumerate() {
+                    let function = call.get("function").unwrap_or(call);
+                    let identity = json!({
+                        "index": index,
+                        "id": call.get("id").cloned().unwrap_or_else(|| json!(format!("call_{index}"))),
+                        "type": "function",
+                        "function": {"name": function.get("name").cloned().unwrap_or(Value::Null)},
+                    });
+                    events.push(sse_data(json!({
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [identity]}, "finish_reason": Value::Null}]
+                    })));
+                    let arguments = function
+                        .get("arguments")
+                        .map(value_to_text)
+                        .unwrap_or_default();
+                    if !arguments.is_empty() {
+                        events.push(sse_data(json!({
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}, "finish_reason": Value::Null}]
+                        })));
+                    }
+                }
+            }
             let done = json!({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -2603,7 +3642,15 @@ fn synthetic_sse_text(endpoint: ProxyEndpoint, payload: &Value) -> String {
                 "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": response_finish_reason(payload)}]
             });
-            format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n", first, done)
+            if let Some(usage) = payload.get("usage") {
+                let mut usage_chunk = done.clone();
+                usage_chunk["choices"] = json!([]);
+                usage_chunk["usage"] = usage.clone();
+                events.push(sse_data(usage_chunk));
+            }
+            events.push(sse_data(done));
+            events.push("data: [DONE]\n\n".to_string());
+            events.concat()
         }
         ProxyEndpoint::Responses => synthetic_responses_sse(payload, &text),
         ProxyEndpoint::Completions => {
@@ -2642,34 +3689,88 @@ fn synthetic_responses_sse(payload: &Value, text: &str) -> String {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("msg_{}", output_index));
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let mut added_item = item.clone();
+        if let Some(object) = added_item.as_object_mut() {
+            object.insert(
+                "status".to_string(),
+                Value::String("in_progress".to_string()),
+            );
+            if kind == "function_call" {
+                object.insert("arguments".to_string(), Value::String(String::new()));
+            }
+        }
         events.push(format!(
             "event: response.output_item.added\ndata: {}\n\n",
-            json!({ "type": "response.output_item.added", "output_index": output_index, "item": item })
+            json!({ "type": "response.output_item.added", "output_index": output_index, "item": added_item })
         ));
-        if item.get("type").and_then(Value::as_str) == Some("message") && !text.is_empty() {
+        if kind == "message" {
+            let content_parts = item.get("content").and_then(Value::as_array);
+            if let Some(content_parts) = content_parts {
+                for (content_index, part) in content_parts.iter().enumerate() {
+                    if part.get("type").and_then(Value::as_str) == Some("refusal") {
+                        if let Some(refusal) = part.get("refusal").and_then(Value::as_str) {
+                            events.push(format!(
+                                "event: response.refusal.delta\ndata: {}\n\n",
+                                json!({"type":"response.refusal.delta","item_id":item_id,"output_index":output_index,"content_index":content_index,"delta":refusal})
+                            ));
+                            events.push(format!(
+                                "event: response.refusal.done\ndata: {}\n\n",
+                                json!({"type":"response.refusal.done","item_id":item_id,"output_index":output_index,"content_index":content_index,"refusal":refusal})
+                            ));
+                        }
+                        continue;
+                    }
+                    let part_text = part.get("text").and_then(Value::as_str).unwrap_or_default();
+                    if part_text.is_empty() {
+                        continue;
+                    }
+                    events.push(format!(
+                        "event: response.content_part.added\ndata: {}\n\n",
+                        json!({
+                            "type": "response.content_part.added",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "part": {"type": "output_text", "text": "", "annotations": []}
+                        })
+                    ));
+                    events.push(format!(
+                        "event: response.output_text.delta\ndata: {}\n\n",
+                        json!({ "type": "response.output_text.delta", "item_id": item_id, "output_index": output_index, "content_index": content_index, "delta": part_text })
+                    ));
+                    events.push(format!(
+                        "event: response.content_part.done\ndata: {}\n\n",
+                        json!({
+                            "type": "response.content_part.done",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "part": {"type": "output_text", "text": part_text, "annotations": part.get("annotations").cloned().unwrap_or_else(|| json!([]))}
+                        })
+                    ));
+                }
+            } else if !text.is_empty() {
+                events.push(format!(
+                    "event: response.content_part.added\ndata: {}\n\n",
+                    json!({"type":"response.content_part.added","item_id":item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})
+                ));
+                events.push(format!(
+                    "event: response.output_text.delta\ndata: {}\n\n",
+                    json!({"type":"response.output_text.delta","item_id":item_id,"output_index":output_index,"content_index":0,"delta":text})
+                ));
+            }
+        } else if kind == "function_call" {
+            let arguments = item.get("arguments").map(value_to_text).unwrap_or_default();
+            if !arguments.is_empty() {
+                events.push(format!(
+                    "event: response.function_call_arguments.delta\ndata: {}\n\n",
+                    json!({"type":"response.function_call_arguments.delta","output_index":output_index,"item_id":item_id,"delta":arguments})
+                ));
+            }
             events.push(format!(
-                "event: response.content_part.added\ndata: {}\n\n",
-                json!({
-                    "type": "response.content_part.added",
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []}
-                })
-            ));
-            events.push(format!(
-                "event: response.output_text.delta\ndata: {}\n\n",
-                json!({ "type": "response.output_text.delta", "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": text })
-            ));
-            events.push(format!(
-                "event: response.content_part.done\ndata: {}\n\n",
-                json!({
-                    "type": "response.content_part.done",
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": text, "annotations": []}
-                })
+                "event: response.function_call_arguments.done\ndata: {}\n\n",
+                json!({"type":"response.function_call_arguments.done","output_index":output_index,"item_id":item_id,"name":item.get("name"),"arguments":item.get("arguments").cloned().unwrap_or_else(|| json!(""))})
             ));
         }
         events.push(format!(
@@ -2678,9 +3779,14 @@ fn synthetic_responses_sse(payload: &Value, text: &str) -> String {
         ));
     }
 
+    let terminal = if payload.get("status").and_then(Value::as_str) == Some("incomplete") {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
     events.push(format!(
-        "event: response.completed\ndata: {}\n\n",
-        json!({ "type": "response.completed", "response": payload })
+        "event: {terminal}\ndata: {}\n\n",
+        json!({ "type": terminal, "response": payload })
     ));
     events.push("data: [DONE]\n\n".to_string());
     events.concat()
@@ -2773,14 +3879,20 @@ struct StreamProtocolTransformer {
     response_id: Option<String>,
     created: Option<u64>,
     model: Option<String>,
+    output_model: Option<String>,
     response_started: bool,
     message_output_index: Option<usize>,
+    content_part_started: bool,
     reasoning_output_index: Option<usize>,
     chat_role_sent: bool,
     text_emitted: bool,
     text: String,
     reasoning_text: String,
+    refusal_text: String,
+    annotations: Vec<Value>,
     function_calls: Vec<StreamFunctionCall>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
     completed_responses_payload: Option<Value>,
     finished: bool,
 }
@@ -2792,6 +3904,12 @@ struct StreamFunctionCall {
     arguments: String,
     started: bool,
     output_index: usize,
+    source_output_index: Option<usize>,
+    arguments_streamed: bool,
+    arguments_completed: bool,
+    custom_tool: bool,
+    identity_emitted: bool,
+    name_emitted: bool,
 }
 
 impl StreamProtocolTransformer {
@@ -2803,14 +3921,20 @@ impl StreamProtocolTransformer {
             response_id: None,
             created: None,
             model: None,
+            output_model: None,
             response_started: false,
             message_output_index: None,
+            content_part_started: false,
             reasoning_output_index: None,
             chat_role_sent: false,
             text_emitted: false,
             text: String::new(),
             reasoning_text: String::new(),
+            refusal_text: String::new(),
+            annotations: Vec::new(),
             function_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
             completed_responses_payload: None,
             finished: false,
         }
@@ -2846,7 +3970,10 @@ impl StreamProtocolTransformer {
                 let Some(payload) = parse_json_safe(&payload) else {
                     continue;
                 };
-                if payload.get("type").and_then(Value::as_str) == Some("response.completed") {
+                if matches!(
+                    payload.get("type").and_then(Value::as_str),
+                    Some("response.completed" | "response.incomplete" | "response.done")
+                ) {
                     if let Some(response) = payload
                         .get("response")
                         .filter(|response| response.is_object())
@@ -2892,6 +4019,14 @@ impl StreamProtocolTransformer {
                 continue;
             }
             self.remember_chat_metadata(&payload);
+            output.push_str(&self.chat_annotations_as_responses(&payload));
+            if let Some(refusal) = payload
+                .pointer("/choices/0/delta/refusal")
+                .or_else(|| payload.pointer("/choices/0/message/refusal"))
+                .and_then(Value::as_str)
+            {
+                output.push_str(&self.chat_refusal_as_responses(refusal));
+            }
             let reasoning = payload
                 .pointer("/choices/0/delta/reasoning_content")
                 .or_else(|| payload.pointer("/choices/0/delta/reasoning"))
@@ -2912,6 +4047,7 @@ impl StreamProtocolTransformer {
                 .pointer("/choices/0/finish_reason")
                 .is_some_and(|reason| !reason.is_null())
             {
+                self.remember_chat_metadata(&payload);
                 output.push_str(&self.finish_as_responses());
             }
         }
@@ -3037,8 +4173,53 @@ impl StreamProtocolTransformer {
                         output.push_str(&self.chat_delta(text));
                     }
                 }
-                Some("response.completed") => {
+                Some("response.reasoning_text.delta")
+                | Some("response.reasoning_summary_text.delta") => {
+                    let delta = payload
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !delta.is_empty() {
+                        self.reasoning_text.push_str(delta);
+                        output.push_str(&self.chat_reasoning_delta(delta));
+                    }
+                }
+                Some("response.refusal.delta") => {
+                    let delta = payload
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !delta.is_empty() {
+                        output.push_str(&self.responses_refusal_as_chat(delta));
+                    }
+                }
+                Some("response.output_item.added") => {
+                    if let Some(item) = payload.get("item") {
+                        if matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("function_call" | "custom_tool_call")
+                        ) {
+                            output.push_str(&self.responses_tool_call_added(&payload, item));
+                        }
+                    }
+                }
+                Some("response.function_call_arguments.delta") => {
+                    output.push_str(&self.responses_tool_arguments_delta(&payload));
+                }
+                Some("response.function_call_arguments.done") => {
+                    output.push_str(&self.responses_tool_arguments_done(&payload));
+                }
+                Some("response.custom_tool_call_input.delta") => {
+                    self.responses_custom_tool_input_delta(&payload);
+                }
+                Some("response.custom_tool_call_input.done") => {
+                    output.push_str(&self.responses_custom_tool_input_done(&payload));
+                }
+                Some("response.incomplete")
+                | Some("response.done")
+                | Some("response.completed") => {
                     let response = payload.get("response").unwrap_or(&payload);
+                    self.remember_responses_metadata(response);
                     if !self.text_emitted {
                         let text = response_text(ProxyEndpoint::Responses, response);
                         if !text.is_empty() {
@@ -3046,12 +4227,422 @@ impl StreamProtocolTransformer {
                             output.push_str(&self.chat_delta(&text));
                         }
                     }
+                    if self.reasoning_text.is_empty() {
+                        let reasoning = responses_reasoning_text(response);
+                        if !reasoning.is_empty() {
+                            self.reasoning_text = reasoning.clone();
+                            output.push_str(&self.chat_reasoning_delta(&reasoning));
+                        }
+                    }
+                    if self.refusal_text.is_empty() {
+                        if let Some(refusal) = response_refusal(ProxyEndpoint::Responses, response)
+                            .and_then(|value| value.as_str().map(str::to_string))
+                        {
+                            output.push_str(&self.responses_refusal_as_chat(&refusal));
+                        }
+                    }
+                    output.push_str(&self.responses_tool_calls_from_completed(response));
                     output.push_str(&self.finish_as_chat(Some(response)));
+                }
+                Some("response.output_text.annotation.added") => {
+                    let annotation = payload.get("annotation").cloned().unwrap_or(Value::Null);
+                    if !annotation.is_null() {
+                        output.push_str(
+                            &self.chat_annotation_delta(response_annotation_to_chat(annotation)),
+                        );
+                    }
                 }
                 _ => {}
             }
         }
         output
+    }
+
+    fn responses_tool_call_slot(&mut self, payload: &Value, item: Option<&Value>) -> usize {
+        let source_index = payload
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok());
+        let call_id = item
+            .and_then(|item| item.get("call_id").or_else(|| item.get("id")))
+            .or_else(|| payload.get("item_id"))
+            .and_then(Value::as_str);
+        let explicit_call_id = item
+            .and_then(|item| item.get("call_id").or_else(|| item.get("id")))
+            .and_then(Value::as_str);
+        let existing = source_index
+            .and_then(|source_index| {
+                self.function_calls
+                    .iter()
+                    .position(|call| call.source_output_index == Some(source_index))
+            })
+            .or_else(|| {
+                call_id.and_then(|call_id| {
+                    self.function_calls
+                        .iter()
+                        .position(|call| call.call_id == call_id)
+                })
+            });
+        let index = existing.unwrap_or_else(|| {
+            self.function_calls.push(StreamFunctionCall::default());
+            self.function_calls.len() - 1
+        });
+        let state = &mut self.function_calls[index];
+        if state.source_output_index.is_none() {
+            state.source_output_index = source_index;
+        }
+        if let Some(call_id) = explicit_call_id.filter(|value| !value.is_empty()) {
+            state.call_id = call_id.to_string();
+        } else if state.call_id.is_empty() {
+            state.call_id = call_id
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{}_{}", index, now_ms()));
+        }
+        if let Some(item) = item {
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                state.name = name.to_string();
+            }
+            state.custom_tool =
+                item.get("type").and_then(Value::as_str) == Some("custom_tool_call");
+        }
+        if let Some(name) = payload.get("name").and_then(Value::as_str) {
+            state.name = name.to_string();
+        }
+        index
+    }
+
+    fn responses_tool_call_added(&mut self, payload: &Value, item: &Value) -> String {
+        let index = self.responses_tool_call_slot(payload, Some(item));
+        let state = &mut self.function_calls[index];
+        state.started = true;
+        let arguments = item
+            .get("arguments")
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                _ => value.to_string(),
+            })
+            .unwrap_or_default();
+        state.arguments = arguments.clone();
+        let mut output = self.responses_tool_identity_delta(index);
+        if !arguments.is_empty() {
+            self.function_calls[index].arguments_streamed = true;
+            output.push_str(&self.chat_tool_call_delta(index, false, false, arguments));
+        }
+        output
+    }
+
+    fn responses_tool_arguments_delta(&mut self, payload: &Value) -> String {
+        let index = self.responses_tool_call_slot(payload, None);
+        let state = &mut self.function_calls[index];
+        let was_started = state.started;
+        state.started = true;
+        let delta = payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        state.arguments.push_str(delta);
+        state.arguments_streamed = true;
+        let mut output = self.responses_tool_identity_delta(index);
+        if !delta.is_empty() {
+            output.push_str(&self.chat_tool_call_delta(index, false, false, delta.to_string()));
+        }
+        let _ = was_started;
+        output
+    }
+
+    fn responses_tool_arguments_done(&mut self, payload: &Value) -> String {
+        let index = self.responses_tool_call_slot(payload, None);
+        let state = &mut self.function_calls[index];
+        let was_started = state.started;
+        state.started = true;
+        let final_arguments = payload
+            .get("arguments")
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                _ => value.to_string(),
+            })
+            .unwrap_or_default();
+        let remainder = if state.arguments_streamed {
+            final_arguments
+                .strip_prefix(&state.arguments)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            state.arguments = final_arguments.clone();
+            final_arguments
+        };
+        state.arguments.push_str(&remainder);
+        state.arguments_streamed = true;
+        state.arguments_completed = true;
+        let mut output = self.responses_tool_identity_delta(index);
+        if !remainder.is_empty() {
+            output.push_str(&self.chat_tool_call_delta(index, false, false, remainder));
+        }
+        let _ = was_started;
+        output
+    }
+
+    fn responses_custom_tool_input_delta(&mut self, payload: &Value) {
+        let index = self.responses_tool_call_slot(payload, None);
+        let state = &mut self.function_calls[index];
+        state.started = true;
+        state.custom_tool = true;
+        state.arguments.push_str(
+            payload
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+    }
+
+    fn responses_custom_tool_input_done(&mut self, payload: &Value) -> String {
+        let index = self.responses_tool_call_slot(payload, None);
+        let state = &mut self.function_calls[index];
+        let was_started = state.started;
+        state.started = true;
+        state.custom_tool = true;
+        let input = payload
+            .get("input")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| state.arguments.clone());
+        state.arguments = json!({"input": input}).to_string();
+        state.arguments_completed = true;
+        let arguments = state.arguments.clone();
+        let mut output = self.responses_tool_identity_delta(index);
+        if !arguments.is_empty() {
+            output.push_str(&self.chat_tool_call_delta(index, false, false, arguments));
+        }
+        let _ = was_started;
+        output
+    }
+
+    fn responses_tool_calls_from_completed(&mut self, response: &Value) -> String {
+        let Some(items) = response.get("output").and_then(Value::as_array) else {
+            return String::new();
+        };
+        let mut output = String::new();
+        for (source_index, item) in items.iter().enumerate() {
+            if !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            ) {
+                continue;
+            }
+            let payload = json!({"output_index": source_index});
+            let index = self.responses_tool_call_slot(&payload, Some(item));
+            let was_started = self.function_calls[index].started;
+            if !was_started {
+                self.function_calls[index].started = true;
+            }
+            output.push_str(&self.responses_tool_identity_delta(index));
+            if self.function_calls[index].custom_tool {
+                let input = item.get("input").cloned().unwrap_or(Value::Null);
+                let arguments = json!({"input": input}).to_string();
+                if !self.function_calls[index].arguments_completed {
+                    self.function_calls[index].arguments = arguments.clone();
+                    self.function_calls[index].arguments_completed = true;
+                    if !self.function_calls[index].arguments_streamed {
+                        output.push_str(&self.chat_tool_call_delta(index, false, false, arguments));
+                    }
+                }
+            } else {
+                let arguments = item
+                    .get("arguments")
+                    .map(|value| match value {
+                        Value::String(text) => text.clone(),
+                        _ => value.to_string(),
+                    })
+                    .unwrap_or_default();
+                if !self.function_calls[index].arguments_completed {
+                    let remainder = if self.function_calls[index].arguments_streamed {
+                        arguments
+                            .strip_prefix(&self.function_calls[index].arguments)
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        arguments.clone()
+                    };
+                    self.function_calls[index].arguments = arguments;
+                    self.function_calls[index].arguments_completed = true;
+                    if !remainder.is_empty() {
+                        output.push_str(&self.chat_tool_call_delta(index, false, false, remainder));
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    fn responses_tool_identity_delta(&mut self, index: usize) -> String {
+        let call = &mut self.function_calls[index];
+        let include_identity = !call.identity_emitted;
+        let include_name = !call.name_emitted && !call.name.is_empty();
+        if include_identity {
+            call.identity_emitted = true;
+        }
+        if include_name {
+            call.name_emitted = true;
+        }
+        if include_identity || include_name {
+            self.chat_tool_call_delta(index, include_identity, include_name, String::new())
+        } else {
+            String::new()
+        }
+    }
+
+    fn chat_reasoning_delta(&mut self, reasoning: &str) -> String {
+        let mut delta = serde_json::Map::new();
+        if !self.chat_role_sent {
+            self.chat_role_sent = true;
+            delta.insert("role".to_string(), Value::String("assistant".to_string()));
+        }
+        delta.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning.to_string()),
+        );
+        self.chat_chunk(delta, Value::Null)
+    }
+
+    fn chat_annotations_as_responses(&mut self, payload: &Value) -> String {
+        let annotations = payload
+            .pointer("/choices/0/delta/annotations")
+            .or_else(|| payload.pointer("/choices/0/message/annotations"))
+            .and_then(Value::as_array);
+        let Some(annotations) = annotations else {
+            return String::new();
+        };
+        let mut output = self.start_responses_message();
+        let id = self.ensure_stream_id("resp");
+        let output_index = self.message_output_index.unwrap_or_default();
+        if !self.content_part_started {
+            self.content_part_started = true;
+            output.push_str(&sse_event(
+                "response.content_part.added",
+                json!({
+                    "type": "response.content_part.added",
+                    "item_id": format!("msg_{}", id),
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                }),
+            ));
+        }
+        for annotation in annotations {
+            let annotation = chat_annotation_to_responses(annotation);
+            if self.annotations.contains(&annotation) {
+                continue;
+            }
+            let annotation_index = self.annotations.len();
+            self.annotations.push(annotation.clone());
+            output.push_str(&sse_event(
+                "response.output_text.annotation.added",
+                json!({
+                    "type": "response.output_text.annotation.added",
+                    "item_id": format!("msg_{}", id),
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "annotation_index": annotation_index,
+                    "annotation": annotation,
+                }),
+            ));
+        }
+        output
+    }
+
+    fn chat_refusal_as_responses(&mut self, refusal: &str) -> String {
+        let mut output = self.start_responses_message();
+        let id = self.ensure_stream_id("resp");
+        let output_index = self.message_output_index.unwrap_or_default();
+        self.refusal_text.push_str(refusal);
+        output.push_str(&sse_event(
+            "response.refusal.delta",
+            json!({
+                "type": "response.refusal.delta",
+                "item_id": format!("msg_{}", id),
+                "output_index": output_index,
+                "content_index": 0,
+                "delta": refusal,
+            }),
+        ));
+        output
+    }
+
+    fn responses_refusal_as_chat(&mut self, refusal: &str) -> String {
+        self.refusal_text.push_str(refusal);
+        let mut delta = serde_json::Map::new();
+        if !self.chat_role_sent {
+            self.chat_role_sent = true;
+            delta.insert("role".to_string(), Value::String("assistant".to_string()));
+        }
+        delta.insert("refusal".to_string(), Value::String(refusal.to_string()));
+        self.chat_chunk(delta, Value::Null)
+    }
+
+    fn responses_message_content(&self) -> Vec<Value> {
+        let mut content = Vec::new();
+        if self.content_part_started {
+            content.push(json!({
+                "type": "output_text",
+                "text": self.text,
+                "annotations": self.annotations,
+            }));
+        }
+        if !self.refusal_text.is_empty() {
+            content.push(json!({"type":"refusal","refusal":self.refusal_text}));
+        }
+        content
+    }
+
+    fn chat_annotation_delta(&mut self, annotation: Value) -> String {
+        let mut delta = serde_json::Map::new();
+        delta.insert("annotations".to_string(), Value::Array(vec![annotation]));
+        self.chat_chunk(delta, Value::Null)
+    }
+
+    fn chat_tool_call_delta(
+        &mut self,
+        index: usize,
+        include_identity: bool,
+        include_name: bool,
+        arguments: String,
+    ) -> String {
+        let state = &self.function_calls[index];
+        let mut function = serde_json::Map::new();
+        if include_name && !state.name.is_empty() {
+            function.insert("name".to_string(), Value::String(state.name.clone()));
+        }
+        if !arguments.is_empty() || (!include_name && !include_identity) {
+            function.insert("arguments".to_string(), Value::String(arguments));
+        }
+        let mut call = serde_json::Map::new();
+        call.insert("index".to_string(), json!(index));
+        if include_identity {
+            call.insert("id".to_string(), Value::String(state.call_id.clone()));
+            call.insert("type".to_string(), Value::String("function".to_string()));
+        }
+        call.insert("function".to_string(), Value::Object(function));
+        let mut delta = serde_json::Map::new();
+        if !self.chat_role_sent {
+            self.chat_role_sent = true;
+            delta.insert("role".to_string(), Value::String("assistant".to_string()));
+        }
+        delta.insert(
+            "tool_calls".to_string(),
+            Value::Array(vec![Value::Object(call)]),
+        );
+        self.chat_chunk(delta, Value::Null)
+    }
+
+    fn chat_chunk(&self, delta: serde_json::Map<String, Value>, finish_reason: Value) -> String {
+        sse_data(json!({
+            "id": self.stream_id("chatcmpl"),
+            "object": "chat.completion.chunk",
+            "created": self.created.unwrap_or_else(|| now_ms() / 1000),
+            "model": self.transformed_model(),
+            "choices": [{"index": 0, "delta": Value::Object(delta), "finish_reason": finish_reason}],
+        }))
     }
 
     fn remember_chat_metadata(&mut self, payload: &Value) {
@@ -3069,6 +4660,15 @@ impl StreamProtocolTransformer {
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+        }
+        if let Some(reason) = payload
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(reason.to_string());
+        }
+        if let Some(usage) = payload.get("usage") {
+            self.usage = Some(usage.clone());
         }
     }
 
@@ -3092,6 +4692,12 @@ impl StreamProtocolTransformer {
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
+        if let Some(usage) = response.get("usage") {
+            self.usage = Some(usage.clone());
+        }
+        if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+            self.finish_reason = Some(response_finish_reason(response));
+        }
     }
 
     fn stream_id(&self, prefix: &str) -> String {
@@ -3105,6 +4711,13 @@ impl StreamProtocolTransformer {
             self.response_id = Some(format!("{}-{}", prefix, now_ms()));
         }
         self.response_id.clone().unwrap_or_default()
+    }
+
+    fn transformed_model(&self) -> String {
+        self.output_model
+            .clone()
+            .or_else(|| self.model.clone())
+            .unwrap_or_default()
     }
 
     fn next_responses_output_index(&self) -> usize {
@@ -3132,7 +4745,7 @@ impl StreamProtocolTransformer {
                     "object": "response",
                     "created_at": self.created.unwrap_or_else(|| now_ms() / 1000),
                     "status": "in_progress",
-                    "model": self.model.clone().unwrap_or_default(),
+                    "model": self.transformed_model(),
                     "output": [],
                 }
             }),
@@ -3165,11 +4778,11 @@ impl StreamProtocolTransformer {
     }
 
     fn responses_text_delta(&mut self, text: &str) -> String {
-        let was_empty = self.text.is_empty();
         let mut output = self.start_responses_message();
         let id = self.ensure_stream_id("resp");
         let output_index = self.message_output_index.unwrap_or_default();
-        if was_empty {
+        if !self.content_part_started {
+            self.content_part_started = true;
             output.push_str(&sse_event(
                 "response.content_part.added",
                 json!({
@@ -3239,6 +4852,22 @@ impl StreamProtocolTransformer {
             return String::new();
         }
         self.finished = true;
+        let finish_reason = self.finish_reason.as_deref().unwrap_or("stop");
+        let incomplete_reason = match finish_reason {
+            "length" => Some("max_output_tokens"),
+            "content_filter" => Some("content_filter"),
+            _ => None,
+        };
+        let response_status = if incomplete_reason.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let output_status = if incomplete_reason.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        };
         let mut output = self.start_responses_response();
         let id = self.ensure_stream_id("resp");
         if let Some(output_index) = self.reasoning_output_index {
@@ -3250,7 +4879,7 @@ impl StreamProtocolTransformer {
                     "item": {
                         "id": format!("rs_{}", id),
                         "type": "reasoning",
-                        "status": "completed",
+                        "status": output_status,
                         "summary": [],
                         "content": [{"type": "reasoning_text", "text": self.reasoning_text}],
                     }
@@ -3258,16 +4887,30 @@ impl StreamProtocolTransformer {
             ));
         }
         if let Some(output_index) = self.message_output_index {
-            output.push_str(&sse_event(
-                "response.content_part.done",
-                json!({
-                    "type": "response.content_part.done",
-                    "item_id": format!("msg_{}", id),
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": self.text, "annotations": []},
-                }),
-            ));
+            if self.content_part_started {
+                output.push_str(&sse_event(
+                    "response.content_part.done",
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": format!("msg_{}", id),
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": self.text, "annotations": self.annotations},
+                    }),
+                ));
+            }
+            if !self.refusal_text.is_empty() {
+                output.push_str(&sse_event(
+                    "response.refusal.done",
+                    json!({
+                        "type": "response.refusal.done",
+                        "item_id": format!("msg_{}", id),
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "refusal": self.refusal_text,
+                    }),
+                ));
+            }
             output.push_str(&sse_event(
                 "response.output_item.done",
                 json!({
@@ -3276,9 +4919,9 @@ impl StreamProtocolTransformer {
                     "item": {
                         "id": format!("msg_{}", id),
                         "type": "message",
-                        "status": "completed",
+                        "status": output_status,
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": self.text, "annotations": []}],
+                        "content": self.responses_message_content(),
                     }
                 }),
             ));
@@ -3305,7 +4948,7 @@ impl StreamProtocolTransformer {
                     "item": {
                         "id": format!("fc_{}", call.call_id),
                         "type": "function_call",
-                        "status": "completed",
+                        "status": output_status,
                         "call_id": call.call_id,
                         "name": call.name,
                         "arguments": call.arguments,
@@ -3320,7 +4963,7 @@ impl StreamProtocolTransformer {
                 json!({
                     "id": format!("rs_{}", id),
                     "type": "reasoning",
-                    "status": "completed",
+                    "status": output_status,
                     "summary": [],
                     "content": [{"type": "reasoning_text", "text": self.reasoning_text}],
                 }),
@@ -3332,9 +4975,9 @@ impl StreamProtocolTransformer {
                 json!({
                     "id": format!("msg_{}", id),
                     "type": "message",
-                    "status": "completed",
+                    "status": output_status,
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": self.text, "annotations": []}],
+                    "content": self.responses_message_content(),
                 }),
             ));
         }
@@ -3345,7 +4988,7 @@ impl StreamProtocolTransformer {
                     json!({
                         "id": format!("fc_{}", call.call_id),
                         "type": "function_call",
-                        "status": "completed",
+                        "status": output_status,
                         "call_id": call.call_id,
                         "name": call.name,
                         "arguments": call.arguments,
@@ -3354,19 +4997,23 @@ impl StreamProtocolTransformer {
             }
         }
         final_output.sort_by_key(|(index, _)| *index);
-        let completed_response = json!({
+        let mut completed_response = json!({
             "id": id,
             "object": "response",
             "created_at": self.created.unwrap_or_else(|| now_ms() / 1000),
-            "status": "completed",
-            "model": self.model.clone().unwrap_or_default(),
+            "status": response_status,
+            "model": self.transformed_model(),
             "output": final_output.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
+            "usage": self.usage.as_ref().map(|usage| usage_as_responses(ProxyEndpoint::ChatCompletions, Some(usage))).unwrap_or_else(|| json!({})),
         });
+        if let Some(reason) = incomplete_reason {
+            completed_response["incomplete_details"] = json!({"reason": reason});
+        }
         self.completed_responses_payload = Some(completed_response.clone());
         output.push_str(&sse_event(
-            "response.completed",
+            if response_status == "incomplete" { "response.incomplete" } else { "response.completed" },
             json!({
-                "type": "response.completed",
+                "type": if response_status == "incomplete" { "response.incomplete" } else { "response.completed" },
                 "response": completed_response,
             }),
         ));
@@ -3381,13 +5028,7 @@ impl StreamProtocolTransformer {
             delta.insert("role".to_string(), Value::String("assistant".to_string()));
         }
         delta.insert("content".to_string(), Value::String(content.to_string()));
-        sse_data(json!({
-            "id": self.stream_id("chatcmpl"),
-            "object": "chat.completion.chunk",
-            "created": self.created.unwrap_or_else(|| now_ms() / 1000),
-            "model": self.model.clone().unwrap_or_default(),
-            "choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}],
-        }))
+        self.chat_chunk(delta, Value::Null)
     }
 
     fn finish_as_chat(&mut self, response: Option<&Value>) -> String {
@@ -3398,16 +5039,28 @@ impl StreamProtocolTransformer {
         if let Some(response) = response {
             self.remember_responses_metadata(response);
         }
-        format!(
-            "{}data: [DONE]\n\n",
-            sse_data(json!({
-                "id": self.stream_id("chatcmpl"),
-                "object": "chat.completion.chunk",
-                "created": self.created.unwrap_or_else(|| now_ms() / 1000),
-                "model": self.model.clone().unwrap_or_default(),
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }))
-        )
+        let has_tool_calls = self.function_calls.iter().any(|call| call.started);
+        let finish_reason = response
+            .map(|response| responses_finish_reason(response, has_tool_calls))
+            .or_else(|| self.finish_reason.clone())
+            .unwrap_or_else(|| {
+                if has_tool_calls {
+                    "tool_calls".to_string()
+                } else {
+                    "stop".to_string()
+                }
+            });
+        let mut final_chunk = json!({
+            "id": self.stream_id("chatcmpl"),
+            "object": "chat.completion.chunk",
+            "created": self.created.unwrap_or_else(|| now_ms() / 1000),
+            "model": self.transformed_model(),
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        });
+        if let Some(usage) = self.usage.as_ref() {
+            final_chunk["usage"] = usage_as_chat(ProxyEndpoint::Responses, Some(usage));
+        }
+        format!("{}data: [DONE]\n\n", sse_data(final_chunk))
     }
 }
 
@@ -3466,6 +5119,7 @@ fn stream_response(
     let body_stream = async_stream::stream! {
         let slot_guard = slot;
         let mut transformer = StreamProtocolTransformer::new(requested_endpoint, upstream_endpoint);
+        transformer.output_model = Some(requested_model.clone());
         let mut request_errors = failed_errors.clone();
         let mut completion = StreamCompletionDetector::default();
         let mut completed = false;
@@ -3708,6 +5362,8 @@ fn stream_text_has_done_marker(text: &str) -> bool {
     }) || parse_sse_data_payloads(text).iter().any(|data| {
         parse_json_safe(data).is_some_and(|payload| {
             payload.get("type").and_then(Value::as_str) == Some("response.completed")
+                || payload.get("type").and_then(Value::as_str) == Some("response.incomplete")
+                || payload.get("type").and_then(Value::as_str) == Some("response.done")
                 || payload
                     .pointer("/choices/0/finish_reason")
                     .is_some_and(|reason| !reason.is_null())
@@ -3864,10 +5520,7 @@ fn embedded_error(payload: Option<&Value>, text: &str) -> Option<FailureInfo> {
         || payload.get("status_code").is_some()
         || provider_code_is_error
         || payload.get("success").and_then(Value::as_bool) == Some(false)
-        || matches!(
-            stream_event_type,
-            "error" | "response.failed" | "response.incomplete"
-        );
+        || matches!(stream_event_type, "error" | "response.failed");
     let error = payload
         .get("error")
         .or_else(|| payload.pointer("/response/error"))
@@ -4056,6 +5709,7 @@ fn is_meaningful_responses_output_item(item: &Value) -> bool {
     let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
         "function_call"
+        | "custom_tool_call"
         | "computer_call"
         | "image_generation_call"
         | "file_search_call"
@@ -4177,7 +5831,34 @@ fn stream_probe_complete(text: &str) -> bool {
     parse_sse_data_payloads(text)
         .iter()
         .filter_map(|data| parse_json_safe(data))
-        .any(|payload| stream_payload_has_meaningful_output(&payload))
+        .any(|payload| {
+            stream_payload_has_meaningful_output(&payload)
+                || stream_payload_is_responses_lifecycle_event(&payload)
+        }) || text.lines().any(|line| {
+        line.strip_prefix("event:")
+            .map(str::trim)
+            .is_some_and(is_responses_lifecycle_event_type)
+    })
+}
+
+fn stream_payload_is_responses_lifecycle_event(payload: &Value) -> bool {
+    payload
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(is_responses_lifecycle_event_type)
+}
+
+fn is_responses_lifecycle_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.created"
+            | "response.in_progress"
+            | "response.output_item.added"
+            | "response.content_part.added"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_text.done"
+            | "response.reasoning_summary_text.done"
+    )
 }
 
 fn stream_payload_has_meaningful_output(payload: &Value) -> bool {
@@ -4208,16 +5889,19 @@ fn stream_payload_has_meaningful_output(payload: &Value) -> bool {
         | Some("response.reasoning_text.delta") => payload
             .get("delta")
             .is_some_and(|value| !value_to_text(value).trim().is_empty()),
-        Some("response.function_call_arguments.delta") => true,
+        Some("response.function_call_arguments.delta")
+        | Some("response.custom_tool_call_input.delta") => true,
         Some("response.output_item.added") | Some("response.output_item.done") => payload
             .get("item")
             .is_some_and(is_meaningful_responses_output_item),
-        Some("response.completed") => payload.get("response").is_some_and(|response| {
-            !response_text(ProxyEndpoint::Responses, response)
-                .trim()
-                .is_empty()
-                || has_meaningful_responses_output(response)
-        }),
+        Some("response.completed") | Some("response.incomplete") | Some("response.done") => {
+            payload.get("response").is_some_and(|response| {
+                !response_text(ProxyEndpoint::Responses, response)
+                    .trim()
+                    .is_empty()
+                    || has_meaningful_responses_output(response)
+            })
+        }
         _ => false,
     }
 }
@@ -4388,6 +6072,7 @@ mod tests {
     use http_body_util::BodyExt;
     use reqwest::Client;
     use std::{path::PathBuf, sync::Arc};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::RwLock;
     use uuid::Uuid;
 
@@ -4478,12 +6163,64 @@ mod tests {
     }
 
     #[test]
-    fn responses_requests_prefer_chat_for_openai_compatible_upstreams() {
+    fn responses_requests_use_native_endpoint_by_default() {
         assert_eq!(
             ProxyEndpoint::Responses.candidates(),
             [
+                ProxyEndpoint::Responses,
+                ProxyEndpoint::ChatCompletions,
+                ProxyEndpoint::Completions,
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_to_responses_policy_routes_matching_target_and_model_first() {
+        let body = json!({"model":"codex-gpt-5", "messages":[{"role":"user","content":"hi"}]});
+        let mut cfg = Config::default();
+        cfg.chat_completions_to_responses_policy.enabled = true;
+        cfg.chat_completions_to_responses_policy.all_targets = false;
+        cfg.chat_completions_to_responses_policy.target_names = vec!["upstream".to_string()];
+        cfg.chat_completions_to_responses_policy.model_patterns = vec!["^codex-".to_string()];
+
+        assert_eq!(
+            endpoint_candidates_for_target(
+                ProxyEndpoint::ChatCompletions,
+                &body,
+                &target(),
+                &cfg,
+            ),
+            vec![
+                ProxyEndpoint::Responses,
+                ProxyEndpoint::ChatCompletions,
+                ProxyEndpoint::Completions,
+            ]
+        );
+    }
+
+    #[test]
+    fn responses_to_chat_policy_routes_matching_target_and_model_first() {
+        let body = json!({"model":"glm-5", "input":"hi"});
+        let mut cfg = Config::default();
+        cfg.responses_to_chat_completions_policy.enabled = true;
+        cfg.responses_to_chat_completions_policy.all_targets = false;
+        cfg.responses_to_chat_completions_policy.target_names = vec!["upstream".to_string()];
+        cfg.responses_to_chat_completions_policy.model_patterns = vec!["^glm-".to_string()];
+
+        assert_eq!(
+            endpoint_candidates_for_target(ProxyEndpoint::Responses, &body, &target(), &cfg),
+            vec![
                 ProxyEndpoint::ChatCompletions,
                 ProxyEndpoint::Responses,
+                ProxyEndpoint::Completions,
+            ]
+        );
+        cfg.pass_through_request_enabled = true;
+        assert_eq!(
+            endpoint_candidates_for_target(ProxyEndpoint::Responses, &body, &target(), &cfg),
+            vec![
+                ProxyEndpoint::Responses,
+                ProxyEndpoint::ChatCompletions,
                 ProxyEndpoint::Completions,
             ]
         );
@@ -4548,8 +6285,8 @@ mod tests {
         assert_eq!(
             endpoint_candidates_for_request(ProxyEndpoint::Responses, &second),
             vec![
-                ProxyEndpoint::ChatCompletions,
                 ProxyEndpoint::Responses,
+                ProxyEndpoint::ChatCompletions,
                 ProxyEndpoint::Completions,
             ]
         );
@@ -4796,7 +6533,7 @@ mod tests {
         assert_eq!(converted["messages"][0]["content"], "answer in json");
         assert_eq!(converted["messages"][1]["role"], "user");
         assert_eq!(converted["messages"][1]["content"], "ping");
-        assert_eq!(converted["max_tokens"], 8);
+        assert_eq!(converted["max_completion_tokens"], 8);
         assert_eq!(converted["parallel_tool_calls"], false);
         assert_eq!(converted["response_format"]["type"], "json_schema");
         assert_eq!(
@@ -5154,20 +6891,86 @@ mod tests {
     }
 
     #[test]
-    fn stream_probe_requires_a_real_output_token_not_only_lifecycle_events() {
+    fn stream_probe_accepts_responses_lifecycle_events_before_output() {
         let lifecycle_only = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
             "event: response.output_item.added\n",
             "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n"
         );
-        assert!(!stream_probe_complete(lifecycle_only));
+        assert!(stream_probe_complete(lifecycle_only));
+        let large_created_event = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"metadata\":\"{}\"}}}}\n\n",
+            "x".repeat(stream_probe_bytes())
+        );
+        assert!(stream_probe_complete(&large_created_event));
         assert!(stream_probe_complete(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n"
         ));
         assert!(stream_probe_complete(
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n"
         ));
+    }
+
+    #[tokio::test]
+    async fn large_responses_created_event_is_not_rejected_by_initial_stream_probe() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream");
+        let address = listener.local_addr().expect("mock address");
+        let padding = "x".repeat(stream_probe_bytes());
+        let created = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"metadata\":\"{padding}\"}}}}\n\n"
+        );
+        let output = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            if socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let chunk_header = format!("{:X}\r\n", created.len());
+            if socket.write_all(chunk_header.as_bytes()).await.is_err()
+                || socket.write_all(created.as_bytes()).await.is_err()
+                || socket.write_all(b"\r\n").await.is_err()
+                || socket.flush().await.is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let chunk_header = format!("{:X}\r\n", output.len());
+            let _ = socket.write_all(chunk_header.as_bytes()).await;
+            let _ = socket.write_all(output.as_bytes()).await;
+            let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+        });
+
+        let response = Client::new()
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .expect("mock response");
+        let inspected = inspect_initial_stream(response, StatusCode::OK.as_u16())
+            .await
+            .expect("inspect stream");
+        assert!(inspected.failure.is_none());
+        assert!(!inspected.chunks.is_empty());
+        assert!(inspected.stream.is_some());
     }
 
     #[test]

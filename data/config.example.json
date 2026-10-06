@@ -19,6 +19,19 @@
     504
   ],
   "requestTimeoutMs": 120000,
+  "passThroughRequestEnabled": false,
+  "chatCompletionsToResponsesPolicy": {
+    "enabled": false,
+    "allTargets": true,
+    "targetNames": [],
+    "modelPatterns": []
+  },
+  "responsesToChatCompletionsPolicy": {
+    "enabled": false,
+    "allTargets": true,
+    "targetNames": [],
+    "modelPatterns": []
+  },
   "logSettings": {
     "maxEntries": 500,
     "maxBytes": 10485760,

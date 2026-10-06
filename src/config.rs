@@ -19,6 +19,27 @@ pub struct Config {
     pub model_source: ModelSourceConfig,
     pub providers: Vec<ProviderConfig>,
     pub models: Vec<ModelConfig>,
+    pub pass_through_request_enabled: bool,
+    pub chat_completions_to_responses_policy: ChatCompletionsToResponsesPolicy,
+    pub responses_to_chat_completions_policy: ResponsesToChatCompletionsPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ChatCompletionsToResponsesPolicy {
+    pub enabled: bool,
+    pub all_targets: bool,
+    pub target_names: Vec<String>,
+    pub model_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ResponsesToChatCompletionsPolicy {
+    pub enabled: bool,
+    pub all_targets: bool,
+    pub target_names: Vec<String>,
+    pub model_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +183,31 @@ impl Default for Config {
                     },
                 ]),
             }],
+            pass_through_request_enabled: false,
+            chat_completions_to_responses_policy: ChatCompletionsToResponsesPolicy::default(),
+            responses_to_chat_completions_policy: ResponsesToChatCompletionsPolicy::default(),
+        }
+    }
+}
+
+impl Default for ResponsesToChatCompletionsPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            all_targets: true,
+            target_names: Vec::new(),
+            model_patterns: Vec::new(),
+        }
+    }
+}
+
+impl Default for ChatCompletionsToResponsesPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            all_targets: true,
+            target_names: Vec::new(),
+            model_patterns: Vec::new(),
         }
     }
 }
