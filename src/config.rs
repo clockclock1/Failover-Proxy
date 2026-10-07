@@ -519,6 +519,8 @@ pub fn endpoint_suffix(path: &str) -> String {
     let suffix = cleaned.strip_prefix("v1/").unwrap_or(cleaned);
     if suffix == "response" {
         "responses".to_string()
+    } else if let Some(resource) = suffix.strip_prefix("response/") {
+        format!("responses/{resource}")
     } else {
         suffix.to_string()
     }

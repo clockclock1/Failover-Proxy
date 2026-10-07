@@ -8,11 +8,13 @@ Failover Proxy 是一个 OpenAI 兼容的大模型故障转移代理，内置可
   - `GET /v1/models` 和 `GET /models`
   - `POST /v1/chat/completions` 和 `POST /chat/completions`
   - `POST /v1/responses`、`POST /responses`、`POST /v1/response` 和 `POST /response`
+  - Responses 资源：`GET/DELETE /v1/responses/{id}`、`POST /v1/responses/{id}/cancel`、`GET /v1/responses/{id}/input_items`、`POST /v1/responses/compact` 和 `POST /v1/responses/input_tokens`
   - `POST /v1/completions` 和 `POST /completions`
 - 自定义代理 API Key，客户端通过 `Authorization: Bearer ...` 调用。
 - Admin Token 登录与 Session 管理，支持 `/api/login`、`/api/logout`、`/api/session`。
 - 多模型故障转移链，每个公开模型可配置有序 targets。
-- Chat Completions 与 Responses 双向适配：自动按目标端点探测并转换请求、普通响应和 SSE 流；覆盖工具调用历史、文本格式、推理片段、结束原因、用量和常见图像/音频/文件/视频内容。`previous_response_id` 等有状态字段仅在本机已有对应响应历史时展开后转换，否则保留到原生 Responses 上游。
+- Chat Completions 与 Responses 双向适配：自动按目标端点探测并转换请求、普通响应和 SSE 流；覆盖工具调用历史、文本格式、推理片段、结束原因、用量和常见图像/音频/文件/视频内容。已知的原生 Responses ID 保持原样并固定回创建它的上游；仅 Chat 转换响应的已知历史会展开后续轮次。
+- Responses 资源路由自动跟随创建响应的上游。上游不支持检索或未保存响应时，`store` 未设为 `false` 的响应会从本地快照回退；`store:false` 不提供本地检索。该短期索引驻留内存，12 小时过期，最多 256 项/32 MiB，服务重启后清空。普通请求仍按既有负载均衡策略选路；只有携带已知 `previous_response_id` 的续轮优先回到原目标。
 - Chat Completions 与 Responses 自动双向路由：普通请求和 Chat 函数工具请求优先走对应原生端点，端点不受支持时自动尝试另一协议；Responses 函数工具请求自动优先尝试 Chat Completions，以兼容只在 Chat 接口实现工具调用的上游。Responses 有状态字段及 Chat 多候选等无法安全转换的请求保留原生路由，无需单独配置。
 - 支持上游字段：`name`、`baseUrl`、`apiKey`、`modelName`、`enabled`、`priority`、`weight`、`maxRetries`、`timeoutMs` 等。
 - 故障转移策略：`priority`、`round-robin`、`weighted`、`latency-based`。
@@ -271,8 +273,10 @@ Failover Proxy is an OpenAI-compatible LLM failover proxy with a visual manageme
   - `GET /v1/models` and `GET /models`
   - `POST /v1/chat/completions` and `POST /chat/completions`
   - `POST /v1/responses`, `POST /responses`, `POST /v1/response`, and `POST /response`
+  - Responses resources: `GET/DELETE /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/compact`, and `POST /v1/responses/input_tokens`
   - `POST /v1/completions` and `POST /completions`
-- Bidirectional Chat Completions / Responses adaptation: endpoint detection converts requests, non-streaming responses, and SSE streams, including tool history, text formats, reasoning, finish reasons, usage, and common image/audio/file/video content. Stateful fields such as `previous_response_id` are expanded only when this process has the matching response history; otherwise the request stays on a native Responses endpoint.
+- Bidirectional Chat Completions / Responses adaptation: endpoint detection converts requests, non-streaming responses, and SSE streams, including tool history, text formats, reasoning, finish reasons, usage, and common image/audio/file/video content. Known native Responses IDs are preserved and pinned to their creating upstream; known Chat-converted histories are expanded for later turns.
+- Responses resource routes follow the upstream that created each response. If that upstream cannot retrieve or did not store a response, a local snapshot is used unless the request set `store:false`. The in-memory index expires after 12 hours and is capped at 256 entries/32 MiB; it is cleared on restart. Normal requests keep the existing load-balancing policy; only continuations with a known `previous_response_id` prefer their original target.
 - Automatic bidirectional Chat Completions / Responses routing: ordinary requests and Chat function-tool requests use their native endpoint first and try the other protocol when unsupported. Responses function-tool requests automatically prefer Chat Completions to support upstreams that implement tool calling only on the Chat endpoint. Stateful Responses fields and Chat multi-choice requests that cannot be safely converted stay on their native route; no separate setting is required.
 - Custom proxy API keys via `Authorization: Bearer ...`.
 - Admin token login and session management with `/api/login`, `/api/logout`, and `/api/session`.

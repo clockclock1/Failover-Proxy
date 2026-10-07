@@ -11,9 +11,9 @@ use crate::{
     AppState,
 };
 use axum::{
-    body::{Body, Bytes},
-    extract::{OriginalUri, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    body::{to_bytes, Body, Bytes},
+    extract::{OriginalUri, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -53,12 +53,16 @@ const MAX_RESPONSE_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 enum ProxyEndpoint {
     ChatCompletions,
     Responses,
+    ResponsesCompact,
+    ResponsesInputTokens,
     Completions,
 }
 
 impl ProxyEndpoint {
     fn from_path(path: &str) -> Self {
         match endpoint_suffix(path).as_str() {
+            "responses/compact" => Self::ResponsesCompact,
+            "responses/input_tokens" => Self::ResponsesInputTokens,
             "responses" => Self::Responses,
             "completions" => Self::Completions,
             _ => Self::ChatCompletions,
@@ -69,6 +73,8 @@ impl ProxyEndpoint {
         match self {
             Self::ChatCompletions => "chat/completions",
             Self::Responses => "responses",
+            Self::ResponsesCompact => "responses/compact",
+            Self::ResponsesInputTokens => "responses/input_tokens",
             Self::Completions => "completions",
         }
     }
@@ -77,12 +83,20 @@ impl ProxyEndpoint {
         match self {
             Self::ChatCompletions => [Self::ChatCompletions, Self::Responses, Self::Completions],
             Self::Responses => [Self::Responses, Self::ChatCompletions, Self::Completions],
+            Self::ResponsesCompact => [Self::ResponsesCompact; 3],
+            Self::ResponsesInputTokens => [Self::ResponsesInputTokens; 3],
             Self::Completions => [Self::Completions, Self::ChatCompletions, Self::Responses],
         }
     }
 }
 
 fn endpoint_candidates_for_request(requested: ProxyEndpoint, body: &Value) -> Vec<ProxyEndpoint> {
+    if matches!(
+        requested,
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens
+    ) {
+        return vec![requested];
+    }
     // A Chat Completions upstream has no equivalent of a server-side Responses
     // conversation.  Do not silently discard stateful or Responses-only work.
     if requested == ProxyEndpoint::Responses && responses_request_requires_native_upstream(body) {
@@ -198,6 +212,11 @@ struct ResponseHistoryEntry {
     input: Vec<Value>,
     output: Vec<Value>,
     instructions: Option<String>,
+    response: Value,
+    public_model: String,
+    target_key: Option<String>,
+    native_upstream: bool,
+    retrievable: bool,
     updated_at: u64,
     expires_at: u64,
     estimated_bytes: usize,
@@ -208,6 +227,8 @@ struct ResponseHistoryRequest {
     parent_id: Option<String>,
     input: Vec<Value>,
     instructions: Option<String>,
+    preferred_target_key: Option<String>,
+    retrievable: bool,
 }
 
 struct ExpandedResponseHistory {
@@ -321,7 +342,11 @@ impl ProxyRuntime {
         });
     }
 
-    fn select_target_api_key(&self, model: &ModelConfig, target: &TargetConfig) -> Option<String> {
+    pub(crate) fn select_target_api_key(
+        &self,
+        model: &ModelConfig,
+        target: &TargetConfig,
+    ) -> Option<String> {
         let keys = target_api_keys(target);
         if keys.is_empty() {
             return None;
@@ -400,6 +425,12 @@ impl ProxyRuntime {
                     .as_ref()
                     .map(String::capacity)
                     .unwrap_or(0)
+                + record.public_model.capacity()
+                + record
+                    .target_key
+                    .as_ref()
+                    .map(String::capacity)
+                    .unwrap_or(0)
                 + record.estimated_bytes;
         }
         usage.finish();
@@ -449,16 +480,61 @@ impl ProxyRuntime {
         })
     }
 
-    fn store_response_history(&self, request: &ResponseHistoryRequest, response: &Value) {
+    fn response_history_entry(&self, response_id: &str) -> Option<ResponseHistoryEntry> {
+        let now = now_ms();
+        let mut entry = self.response_history.get_mut(response_id)?;
+        if entry.expires_at <= now {
+            drop(entry);
+            self.response_history.remove(response_id);
+            return None;
+        }
+        entry.updated_at = now;
+        entry.expires_at = now.saturating_add(RESPONSE_HISTORY_TTL_MS);
+        Some(entry.clone())
+    }
+
+    fn remove_response_history(&self, response_id: &str) -> bool {
+        self.response_history.remove(response_id).is_some()
+    }
+
+    fn store_response_history(
+        &self,
+        request: &ResponseHistoryRequest,
+        response: &Value,
+        public_model: &str,
+        target: &TargetConfig,
+        model: &ModelConfig,
+        native_upstream: bool,
+    ) {
         let Some(response_id) = response.get("id").and_then(Value::as_str) else {
             return;
         };
-        let Some(output) = response.get("output").and_then(Value::as_array) else {
-            return;
+        let output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let keep_snapshot = request.retrievable;
+        let keep_conversation = keep_snapshot || !native_upstream;
+        let stored_input = if keep_conversation {
+            request.input.clone()
+        } else {
+            Vec::new()
+        };
+        let stored_output = if keep_conversation {
+            output
+        } else {
+            Vec::new()
+        };
+        let stored_response = if keep_snapshot {
+            response.clone()
+        } else {
+            Value::Null
         };
         let estimated_bytes = serde_json::to_vec(&json!({
-            "input": request.input,
-            "output": output,
+            "input": stored_input,
+            "output": stored_output,
+            "response": stored_response,
         }))
         .map(|value| value.len())
         .unwrap_or_default();
@@ -475,9 +551,18 @@ impl ProxyRuntime {
             response_id.to_string(),
             ResponseHistoryEntry {
                 parent_id: request.parent_id.clone(),
-                input: request.input.clone(),
-                output: output.clone(),
-                instructions: request.instructions.clone(),
+                input: stored_input,
+                output: stored_output,
+                instructions: if keep_conversation {
+                    request.instructions.clone()
+                } else {
+                    None
+                },
+                response: stored_response,
+                public_model: public_model.to_string(),
+                target_key: Some(target_key(model, target)),
+                native_upstream,
+                retrievable: keep_snapshot,
                 updated_at: now,
                 expires_at: now.saturating_add(RESPONSE_HISTORY_TTL_MS),
                 estimated_bytes,
@@ -611,6 +696,309 @@ pub async fn proxy_endpoint(
     proxy_completion(state, headers, uri.path().to_string(), body).await
 }
 
+pub async fn responses_resource_endpoint(
+    State(state): State<AppState>,
+    request: Request,
+) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let pathname = uri.path().to_string();
+    let endpoint = ProxyEndpoint::from_path(&pathname);
+    if matches!(
+        endpoint,
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens
+    ) {
+        if method != Method::POST {
+            return send_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed", None);
+        }
+        let (parts, body) = request.into_parts();
+        let body = match to_bytes(body, usize::MAX).await {
+            Ok(body) => body,
+            Err(err) => return send_error(StatusCode::BAD_REQUEST, &err.to_string(), None),
+        };
+        return proxy_completion(state, parts.headers, pathname, body).await;
+    }
+
+    let cfg = state.config.read().await.clone();
+    if !auth::is_proxy_key(request.headers(), &cfg) {
+        return send_error(StatusCode::UNAUTHORIZED, "Invalid proxy API key", None);
+    }
+
+    let Some(resource_path) = endpoint_suffix(&pathname)
+        .strip_prefix("responses/")
+        .map(str::to_string)
+    else {
+        return send_error(StatusCode::NOT_FOUND, "Unknown Responses resource", None);
+    };
+    let segments = resource_path.split('/').collect::<Vec<_>>();
+    if segments.is_empty() || !valid_response_id(segments[0]) {
+        return send_error(StatusCode::BAD_REQUEST, "Invalid response ID", None);
+    }
+    let response_id = segments[0];
+    let operation = match segments.as_slice() {
+        [_] => "response",
+        [_, "input_items"] => "input_items",
+        [_, "cancel"] => "cancel",
+        _ => return send_error(StatusCode::NOT_FOUND, "Unknown Responses resource", None),
+    };
+    let supported_method = match operation {
+        "response" => method == Method::GET || method == Method::DELETE,
+        "input_items" => method == Method::GET,
+        "cancel" => method == Method::POST,
+        _ => false,
+    };
+    if !supported_method {
+        return send_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed", None);
+    }
+    let Some(entry) = state.proxy_runtime.response_history_entry(response_id) else {
+        return send_error(StatusCode::NOT_FOUND, "Response not found or expired", None);
+    };
+
+    if entry.native_upstream {
+        return forward_native_response_resource(&state, request, &uri, &entry, operation, &cfg)
+            .await;
+    }
+    if !entry.retrievable {
+        return send_error(StatusCode::NOT_FOUND, "Response was not stored", None);
+    }
+
+    match (operation, method) {
+        ("response", Method::GET) => Json(entry.response).into_response(),
+        ("response", Method::DELETE) => {
+            state.proxy_runtime.remove_response_history(response_id);
+            Json(json!({
+                "id": response_id,
+                "object": "response.deleted",
+                "deleted": true,
+            }))
+            .into_response()
+        }
+        ("input_items", Method::GET) => response_input_items_page(&entry.input, uri.query()),
+        ("cancel", Method::POST) => send_error(
+            StatusCode::CONFLICT,
+            "This response was completed by a non-native upstream and cannot be cancelled",
+            None,
+        ),
+        _ => send_error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed", None),
+    }
+}
+
+fn valid_response_id(response_id: &str) -> bool {
+    !response_id.is_empty()
+        && response_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
+fn response_input_items_page(input: &[Value], query: Option<&str>) -> Response {
+    let mut after = None;
+    let mut limit = 20usize;
+    let mut descending = false;
+    for (key, value) in query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+    {
+        match key {
+            "after" => after = Some(value),
+            "limit" => limit = value.parse::<usize>().unwrap_or(20).clamp(1, 100),
+            "order" => descending = value == "desc",
+            _ => {}
+        }
+    }
+    let mut items = input.to_vec();
+    if descending {
+        items.reverse();
+    }
+    if let Some(after) = after {
+        if let Some(index) = items
+            .iter()
+            .position(|item| item.get("id").and_then(Value::as_str) == Some(after))
+        {
+            items.drain(..=index);
+        }
+    }
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let first_id = items.first().and_then(|item| item.get("id")).cloned();
+    let last_id = items.last().and_then(|item| item.get("id")).cloned();
+    Json(json!({
+        "object": "list",
+        "data": items,
+        "has_more": has_more,
+        "first_id": first_id,
+        "last_id": last_id,
+    }))
+    .into_response()
+}
+
+async fn forward_native_response_resource(
+    state: &AppState,
+    request: Request,
+    uri: &axum::http::Uri,
+    entry: &ResponseHistoryEntry,
+    operation: &str,
+    cfg: &Config,
+) -> Response {
+    let Some(model) = state
+        .model_source
+        .find_model(cfg, &entry.public_model)
+        .await
+    else {
+        return send_error(
+            StatusCode::NOT_FOUND,
+            "The model that owns this response is no longer configured",
+            None,
+        );
+    };
+    let Some(preferred_key) = entry.target_key.as_deref() else {
+        return send_error(
+            StatusCode::NOT_FOUND,
+            "Response target is unavailable",
+            None,
+        );
+    };
+    let Some(target) = model
+        .targets
+        .iter()
+        .find(|target| target_key(&model, target) == preferred_key)
+    else {
+        return send_error(
+            StatusCode::NOT_FOUND,
+            "The upstream target that owns this response is no longer configured",
+            None,
+        );
+    };
+    let Some(api_key) = state.proxy_runtime.select_target_api_key(&model, target) else {
+        return send_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Response target has no API key",
+            None,
+        );
+    };
+    let resource_suffix = endpoint_suffix(uri.path());
+    let Some(response_id) = resource_suffix
+        .strip_prefix("responses/")
+        .and_then(|resource| resource.split('/').next())
+        .filter(|segment| valid_response_id(segment))
+    else {
+        return send_error(StatusCode::BAD_REQUEST, "Invalid response ID", None);
+    };
+    let suffix = match operation {
+        "input_items" => format!("/responses/{response_id}/input_items"),
+        "cancel" => format!("/responses/{response_id}/cancel"),
+        _ => format!("/responses/{response_id}"),
+    };
+    let mut url = format!("{}{}", trim_slashes(&target.base_url), suffix);
+    if let Some(query) = uri.query() {
+        url.push('?');
+        url.push_str(query);
+    }
+
+    let method = request.method().clone();
+    let is_get = method == Method::GET;
+    let is_delete = method == Method::DELETE;
+    let inbound_headers = request.headers().clone();
+    let (_, request_body) = request.into_parts();
+    let body = match to_bytes(request_body, usize::MAX).await {
+        Ok(body) => body,
+        Err(err) => return send_error(StatusCode::BAD_REQUEST, &err.to_string(), None),
+    };
+    let mut outbound = state
+        .client
+        .request(method, url)
+        .bearer_auth(api_key)
+        .timeout(target_timeout(target, cfg));
+    for name in [
+        "openai-organization",
+        "openai-project",
+        "openai-beta",
+        "accept",
+        "content-type",
+    ] {
+        if let Some(value) = inbound_headers.get(name) {
+            outbound = outbound.header(name, value);
+        }
+    }
+    if !body.is_empty() {
+        outbound = outbound.body(body);
+    }
+    let upstream = match outbound.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            return send_error(
+                if err.is_timeout() {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                &err.to_string(),
+                None,
+            )
+        }
+    };
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream_headers = upstream.headers().clone();
+    let body = match upstream.bytes().await {
+        Ok(body) => body,
+        Err(err) => return send_error(StatusCode::BAD_GATEWAY, &err.to_string(), None),
+    };
+    if entry.retrievable && matches!(status.as_u16(), 404 | 405 | 501) {
+        match (operation, is_get, is_delete) {
+            ("response", true, _) => return Json(entry.response.clone()).into_response(),
+            ("input_items", true, _) => {
+                return response_input_items_page(&entry.input, uri.query())
+            }
+            ("response", false, true) => {
+                state.proxy_runtime.remove_response_history(response_id);
+                return Json(json!({
+                    "id": response_id,
+                    "object": "response.deleted",
+                    "deleted": true,
+                }))
+                .into_response();
+            }
+            _ => {}
+        }
+    }
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    for (name, value) in &upstream_headers {
+        if matches!(
+            name.as_str(),
+            "connection"
+                | "content-length"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        response.headers_mut().append(name.clone(), value.clone());
+    }
+    if !response.headers().contains_key(header::CONTENT_TYPE) {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    response.headers_mut().insert(
+        "x-proxy-target",
+        HeaderValue::from_str(&target.name).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    response.headers_mut().insert(
+        "x-proxy-model",
+        HeaderValue::from_str(&target.model_name).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    response
+}
+
 fn response_input_items(input: Option<&Value>) -> Vec<Value> {
     match input {
         Some(Value::Array(items)) => items.clone(),
@@ -636,6 +1024,7 @@ fn prepare_response_history_request(
         .get("instructions")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let retrievable = body.get("store").and_then(Value::as_bool) != Some(false);
     let previous_response_id = body
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -645,11 +1034,29 @@ fn prepare_response_history_request(
             parent_id: None,
             input,
             instructions,
+            preferred_target_key: None,
+            retrievable,
         });
     };
-    let Some(history) = runtime.expand_response_history(&previous_response_id) else {
+    let previous = runtime.response_history_entry(&previous_response_id);
+    let Some(previous) = previous else {
         // This ID was not issued by this process. Preserve it for a native
         // Responses upstream instead of pretending the conversation is known.
+        return None;
+    };
+    let preferred_target_key = previous.target_key.clone();
+    if previous.native_upstream {
+        // Native Responses IDs must be sent back to the provider unchanged. The
+        // local index is only used to keep the request on its owning target.
+        return Some(ResponseHistoryRequest {
+            parent_id: Some(previous_response_id),
+            input,
+            instructions,
+            preferred_target_key,
+            retrievable,
+        });
+    }
+    let Some(history) = runtime.expand_response_history(&previous_response_id) else {
         return None;
     };
     let mut expanded_input = history.input;
@@ -671,6 +1078,8 @@ fn prepare_response_history_request(
         parent_id: Some(previous_response_id),
         input,
         instructions,
+        preferred_target_key,
+        retrievable,
     })
 }
 
@@ -719,13 +1128,27 @@ async fn proxy_completion(
             None,
         );
     }
-    let targets = enabled_targets(&state, &cfg, &model).await;
+    let mut targets = enabled_targets(&state, &cfg, &model).await;
     if targets.is_empty() {
         return send_error(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!("Model '{}' has no enabled targets", requested_model),
             None,
         );
+    }
+    if let Some(preferred_target_key) = response_history_request
+        .as_ref()
+        .and_then(|request| request.preferred_target_key.as_deref())
+    {
+        // Stateful Responses continuations stay on their owning target when it
+        // is still enabled. The existing strategy order remains intact for all
+        // other requests, and the remaining targets retain their relative order.
+        if let Some(index) = targets
+            .iter()
+            .position(|target| target_key(&model, target) == preferred_target_key)
+        {
+            targets.rotate_left(index);
+        }
     }
     let slot = state.proxy_runtime.acquire(&model, &requested_model).await;
     let thread_id = slot.thread_id.as_deref().unwrap_or_default().to_string();
@@ -1153,9 +1576,14 @@ async fn proxy_loop(
                     if let (Some(history_request), Some(response_payload)) =
                         (response_history_request.as_ref(), parse_json_safe(&text))
                     {
-                        state
-                            .proxy_runtime
-                            .store_response_history(history_request, &response_payload);
+                        state.proxy_runtime.store_response_history(
+                            history_request,
+                            &response_payload,
+                            &model.public_name,
+                            &target,
+                            model,
+                            used_endpoint == ProxyEndpoint::Responses,
+                        );
                     }
                 }
                 return raw_response(
@@ -1269,9 +1697,14 @@ async fn proxy_loop(
                         response_history_request.as_ref(),
                         parse_json_safe(&response_text),
                     ) {
-                        state
-                            .proxy_runtime
-                            .store_response_history(history_request, &response_payload);
+                        state.proxy_runtime.store_response_history(
+                            history_request,
+                            &response_payload,
+                            &model.public_name,
+                            &target,
+                            model,
+                            used_endpoint == ProxyEndpoint::Responses,
+                        );
                     }
                 }
                 return synthetic_stream_response(
@@ -1643,6 +2076,7 @@ fn compact_request_context(body: &Value, requested: ProxyEndpoint) -> Option<Val
                 compact_text_context(&mut next, "input", input_budget)
             }
         }
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => false,
         ProxyEndpoint::Completions => compact_text_context(&mut next, "prompt", input_budget),
     };
     (changed && estimate_json_tokens(&next) < before_tokens).then_some(next)
@@ -1881,6 +2315,9 @@ fn build_upstream_body(
     out.insert("model".to_string(), Value::String(model));
     out.insert("stream".to_string(), Value::Bool(stream));
     match upstream {
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => {
+            return body.clone();
+        }
         ProxyEndpoint::ChatCompletions => {
             out.insert(
                 "messages".to_string(),
@@ -2084,6 +2521,7 @@ fn request_to_chat_messages(body: &Value, requested: ProxyEndpoint) -> Vec<Value
         ProxyEndpoint::Responses => {
             messages.extend(responses_input_to_chat_messages(body.get("input")));
         }
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => {}
         ProxyEndpoint::Completions => {
             messages.push(chat_message("user", request_to_prompt(body, requested)));
         }
@@ -2470,6 +2908,9 @@ fn request_to_responses_input(body: &Value, requested: ProxyEndpoint) -> Value {
             Value::Array(input)
         }
         ProxyEndpoint::Completions => Value::String(request_to_prompt(body, requested)),
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => {
+            body.get("input").cloned().unwrap_or(Value::Null)
+        }
     }
 }
 
@@ -2653,6 +3094,7 @@ fn request_to_prompt(body: &Value, requested: ProxyEndpoint) -> String {
                     .join("\n")
             })
             .unwrap_or_default(),
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => String::new(),
     }
 }
 
@@ -2836,6 +3278,7 @@ fn response_payload_as(
         ProxyEndpoint::Completions => {
             response_as_completions(upstream, payload, requested_model, target)
         }
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => payload.clone(),
     }
 }
 
@@ -3099,6 +3542,7 @@ fn response_text(upstream: ProxyEndpoint, payload: &Value) -> String {
             .pointer("/choices/0/text")
             .map(value_to_text)
             .unwrap_or_default(),
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => String::new(),
     }
 }
 
@@ -3609,6 +4053,9 @@ fn synthetic_sse_text(endpoint: ProxyEndpoint, payload: &Value) -> String {
             events.concat()
         }
         ProxyEndpoint::Responses => synthetic_responses_sse(payload, &text),
+        ProxyEndpoint::ResponsesCompact | ProxyEndpoint::ResponsesInputTokens => {
+            sse_data(payload.clone())
+        }
         ProxyEndpoint::Completions => {
             let chunk = json!({
                 "id": response_id(payload, "cmpl"),
@@ -5114,7 +5561,14 @@ fn stream_response(
             ) {
                 state
                     .proxy_runtime
-                    .store_response_history(history_request, &response_payload);
+                    .store_response_history(
+                        history_request,
+                        &response_payload,
+                        &model.public_name,
+                        &target,
+                        &model,
+                        upstream_endpoint == ProxyEndpoint::Responses,
+                    );
             }
             if !transformed.is_empty() {
                 yield Ok::<Bytes, Infallible>(transformed);
@@ -5151,7 +5605,14 @@ fn stream_response(
                             ) {
                                 state
                                     .proxy_runtime
-                                    .store_response_history(history_request, &response_payload);
+                                    .store_response_history(
+                                        history_request,
+                                        &response_payload,
+                                        &model.public_name,
+                                        &target,
+                                        &model,
+                                        upstream_endpoint == ProxyEndpoint::Responses,
+                                    );
                             }
                             if !transformed.is_empty() {
                                 yield Ok::<Bytes, Infallible>(transformed);
@@ -6132,6 +6593,43 @@ mod tests {
     }
 
     #[test]
+    fn responses_management_endpoints_keep_the_responses_protocol() {
+        assert_eq!(
+            format!("{:?}", ProxyEndpoint::from_path("/v1/responses/compact")),
+            "ResponsesCompact"
+        );
+        assert_eq!(
+            endpoint_candidates_for_request(
+                ProxyEndpoint::ResponsesCompact,
+                &json!({"model":"public-model"})
+            ),
+            vec![ProxyEndpoint::ResponsesCompact]
+        );
+        assert_eq!(
+            upstream_endpoint_url(&target(), ProxyEndpoint::ResponsesCompact),
+            "http://example.com/v1/responses/compact"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                ProxyEndpoint::from_path("/v1/responses/input_tokens")
+            ),
+            "ResponsesInputTokens"
+        );
+        assert_eq!(
+            endpoint_candidates_for_request(
+                ProxyEndpoint::ResponsesInputTokens,
+                &json!({"model":"public-model"})
+            ),
+            vec![ProxyEndpoint::ResponsesInputTokens]
+        );
+        assert_eq!(
+            upstream_endpoint_url(&target(), ProxyEndpoint::ResponsesInputTokens),
+            "http://example.com/v1/responses/input_tokens"
+        );
+    }
+
+    #[test]
     fn function_tool_requests_automatically_prefer_the_compatible_endpoint() {
         let responses = json!({
             "model": "public-model",
@@ -6220,6 +6718,8 @@ mod tests {
         let first_request =
             prepare_response_history_request(&runtime, &mut first, ProxyEndpoint::Responses)
                 .expect("initial response request is cacheable");
+        let target = target();
+        let model = model();
         runtime.store_response_history(
             &first_request,
             &json!({
@@ -6231,6 +6731,10 @@ mod tests {
                     "arguments": "{\"command\":\"dir\"}"
                 }]
             }),
+            "public-model",
+            &target,
+            &model,
+            false,
         );
 
         let mut second = json!({
@@ -6248,6 +6752,11 @@ mod tests {
 
         assert_eq!(second_request.parent_id.as_deref(), Some("resp_local_1"));
         assert!(second.get("previous_response_id").is_none());
+        let expected_target_key = target_key(&model, &target);
+        assert_eq!(
+            second_request.preferred_target_key.as_deref(),
+            Some(expected_target_key.as_str())
+        );
         assert_eq!(second["instructions"], "Use tools when needed.");
         assert_eq!(second["input"].as_array().map(Vec::len), Some(3));
         assert_eq!(second["input"][1]["type"], "function_call");
@@ -6260,6 +6769,310 @@ mod tests {
                 ProxyEndpoint::Completions,
             ]
         );
+    }
+
+    #[test]
+    fn native_response_history_keeps_provider_id_and_pins_its_target() {
+        let runtime = ProxyRuntime::default();
+        let target = target();
+        let model = model();
+        let first_request = ResponseHistoryRequest {
+            parent_id: None,
+            input: vec![json!({"role":"user","content":"hello"})],
+            instructions: None,
+            preferred_target_key: None,
+            retrievable: true,
+        };
+        runtime.store_response_history(
+            &first_request,
+            &json!({
+                "id":"resp_native_123",
+                "object":"response",
+                "status":"completed",
+                "output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]
+            }),
+            "public-model",
+            &target,
+            &model,
+            true,
+        );
+
+        let mut second = json!({
+            "model":"public-model",
+            "previous_response_id":"resp_native_123",
+            "input":"next"
+        });
+        let request =
+            prepare_response_history_request(&runtime, &mut second, ProxyEndpoint::Responses)
+                .expect("native response records should retain target routing metadata");
+        assert_eq!(second["previous_response_id"], "resp_native_123");
+        assert_eq!(second["input"], "next");
+        assert_eq!(request.parent_id.as_deref(), Some("resp_native_123"));
+        let expected_target_key = target_key(&model, &target);
+        assert_eq!(
+            request.preferred_target_key.as_deref(),
+            Some(expected_target_key.as_str())
+        );
+        assert_eq!(
+            endpoint_candidates_for_request(ProxyEndpoint::Responses, &second),
+            vec![ProxyEndpoint::Responses]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_response_resources_retrieve_input_items_delete_and_reject_cancel() {
+        let state = test_state().await;
+        let target = target();
+        let model = model();
+        let request_history = ResponseHistoryRequest {
+            parent_id: None,
+            input: vec![
+                json!({"id":"item_1","type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}),
+                json!({"id":"item_2","type":"message","role":"user","content":[{"type":"input_text","text":"there"}]}),
+            ],
+            instructions: None,
+            preferred_target_key: None,
+            retrievable: true,
+        };
+        state.proxy_runtime.store_response_history(
+            &request_history,
+            &json!({
+                "id":"resp_local_resource",
+                "object":"response",
+                "status":"completed",
+                "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
+            }),
+            "public-model",
+            &target,
+            &model,
+            false,
+        );
+
+        let get_response = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/responses/resp_local_resource")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), get_response).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], "resp_local_resource");
+
+        let get_items = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/responses/resp_local_resource/input_items?after=item_1&limit=1")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), get_items).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"][0]["id"], "item_2");
+        assert!(!body["has_more"].as_bool().unwrap());
+
+        let cancel = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses/resp_local_resource/cancel")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), cancel).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let delete = Request::builder()
+            .method(Method::DELETE)
+            .uri("/v1/responses/resp_local_resource")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), delete).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state
+            .proxy_runtime
+            .response_history_entry("resp_local_resource")
+            .is_none());
+
+        let mut unstored_body = json!({
+            "model":"public-model",
+            "input":"temporary turn",
+            "store":false
+        });
+        let unstored_request = prepare_response_history_request(
+            &state.proxy_runtime,
+            &mut unstored_body,
+            ProxyEndpoint::Responses,
+        )
+        .unwrap();
+        state.proxy_runtime.store_response_history(
+            &unstored_request,
+            &json!({"id":"resp_unstored_local","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"temporary answer"}]}]}),
+            "public-model",
+            &target,
+            &model,
+            false,
+        );
+        let entry = state
+            .proxy_runtime
+            .response_history_entry("resp_unstored_local")
+            .unwrap();
+        assert!(!entry.retrievable);
+        assert!(entry.response.is_null());
+        assert!(state
+            .proxy_runtime
+            .expand_response_history("resp_unstored_local")
+            .is_some());
+        let get_unstored = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/responses/resp_unstored_local")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state), get_unstored).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn native_response_resources_forward_to_the_response_owning_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut target = target();
+        target.base_url = format!("http://{address}/v1");
+        let model = ModelConfig {
+            targets: vec![target.clone()],
+            ..model()
+        };
+        let state = test_state().await;
+        state.config.write().await.models = vec![model.clone()];
+        state.proxy_runtime.store_response_history(
+            &ResponseHistoryRequest {
+                parent_id: None,
+                input: vec![json!({"role":"user","content":"hello"})],
+                instructions: None,
+                preferred_target_key: None,
+                retrievable: true,
+            },
+            &json!({"id":"resp_native_route_1","object":"response","output":[]}),
+            "public-model",
+            &target,
+            &model,
+            true,
+        );
+
+        let upstream = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer sk-test"));
+                assert!(!request.contains("sk-local-test"));
+                let (status, response) = match index {
+                    0 => {
+                        assert!(request.contains(
+                            "GET /v1/responses/resp_native_route_1/input_items?limit=1 HTTP/1.1"
+                        ));
+                        ("200 OK", r#"{"object":"list","data":[],"has_more":false}"#)
+                    }
+                    1 => {
+                        assert!(request.contains("GET /v1/responses/resp_native_route_1 HTTP/1.1"));
+                        ("404 Not Found", r#"{"error":{"message":"not stored"}}"#)
+                    }
+                    2 => {
+                        assert!(request
+                            .contains("POST /v1/responses/resp_native_route_1/cancel HTTP/1.1"));
+                        (
+                            "200 OK",
+                            r#"{"id":"resp_native_route_1","status":"cancelling"}"#,
+                        )
+                    }
+                    _ => {
+                        assert!(
+                            request.contains("DELETE /v1/responses/resp_native_route_1 HTTP/1.1")
+                        );
+                        ("404 Not Found", r#"{"error":{"message":"not stored"}}"#)
+                    }
+                };
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                socket.write_all(wire.as_bytes()).await.unwrap();
+            }
+        });
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/responses/resp_native_route_1/input_items?limit=1")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-proxy-target").unwrap(),
+            "upstream"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["object"], "list");
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/responses/resp_native_route_1")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], "resp_native_route_1");
+        assert_eq!(body["output"].as_array().unwrap().len(), 0);
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses/resp_native_route_1/cancel")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "cancelling");
+
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri("/v1/responses/resp_native_route_1")
+            .header(header::AUTHORIZATION, "Bearer sk-local-test")
+            .body(Body::empty())
+            .unwrap();
+        let response = responses_resource_endpoint(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["deleted"], true);
+        assert!(state
+            .proxy_runtime
+            .response_history_entry("resp_native_route_1")
+            .is_none());
+        upstream.await.unwrap();
     }
 
     #[test]
@@ -7131,6 +7944,8 @@ mod tests {
                     "content": [{"type": "input_text", "text": "hello"}],
                 })],
                 instructions: None,
+                preferred_target_key: None,
+                retrievable: true,
             }),
             slot.into_stream_guard(),
         );
@@ -7196,6 +8011,8 @@ mod tests {
                     "content": [{"type": "input_text", "text": "hello"}],
                 })],
                 instructions: None,
+                preferred_target_key: None,
+                retrievable: true,
             }),
             slot.into_stream_guard(),
         );

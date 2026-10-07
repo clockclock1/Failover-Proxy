@@ -9,7 +9,7 @@ mod stats;
 use axum::{
     extract::DefaultBodyLimit,
     http::{HeaderName, Method},
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
 use clap::Parser;
@@ -130,17 +130,21 @@ async fn main() -> anyhow::Result<()> {
 
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([
             HeaderName::from_static("authorization"),
             HeaderName::from_static("content-type"),
             HeaderName::from_static("x-admin-token"),
             HeaderName::from_static("x-admin-session"),
+            HeaderName::from_static("openai-organization"),
+            HeaderName::from_static("openai-project"),
+            HeaderName::from_static("openai-beta"),
         ])
         .expose_headers([
             HeaderName::from_static("content-type"),
             HeaderName::from_static("x-proxy-target"),
             HeaderName::from_static("x-proxy-model"),
+            HeaderName::from_static("x-request-id"),
         ]);
 
     let app = Router::new()
@@ -207,6 +211,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/chat/completions", post(proxy::proxy_endpoint))
         .route("/v1/responses", post(proxy::proxy_endpoint))
         .route("/responses", post(proxy::proxy_endpoint))
+        .route(
+            "/v1/responses/{*path}",
+            any(proxy::responses_resource_endpoint),
+        )
+        .route(
+            "/responses/{*path}",
+            any(proxy::responses_resource_endpoint),
+        )
+        .route(
+            "/v1/response/{*path}",
+            any(proxy::responses_resource_endpoint),
+        )
+        .route("/response/{*path}", any(proxy::responses_resource_endpoint))
         .route("/v1/response", post(proxy::proxy_endpoint))
         .route("/response", post(proxy::proxy_endpoint))
         .route("/v1/completions", post(proxy::proxy_endpoint))
